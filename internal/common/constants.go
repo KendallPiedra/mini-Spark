@@ -30,7 +30,6 @@ const (
 	TaskStatusRetryNeeded = "RETRY_NEEDED"
 
 // Tipos de Destino
-	OutputTypeLocalSpill = "LOCAL_SPILL" // Salida simple (1 archivo)
 	OutputTypeShuffle    = "SHUFFLE"     // Salida particionada (N archivos)
 )
 

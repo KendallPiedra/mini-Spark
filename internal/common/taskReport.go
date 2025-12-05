@@ -14,5 +14,7 @@ type TaskReport struct {
 type ShuffleMeta struct {
 	PartitionKey string `json:"partition_key"` // La clave de partición (ej: "part_0_of_4")
 	LocationURL  string `json:"location_url"`  // URL en el Worker para que otro Worker lo descargue (ej: "http://worker-id:8081/data/...")
-	SizeKB       uint64 `json:"size_kb"`       // Tamaño del dato para optimización
+	Path         string `json:"path"`          // Ruta local donde está el archivo
+	Size       uint64 `json:"size"`       // Tamaño del dato para optimización
 }
+
