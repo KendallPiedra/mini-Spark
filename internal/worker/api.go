@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
 	"mini-spark/internal/common"
 )
 
@@ -18,11 +17,9 @@ var MasterAddress = "http://localhost:8080"
 // StartServer inicia el servidor HTTP del Worker.
 func StartServer(workerID string, port int) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tasks", HandleTaskAssignment)
-	// NOTA: Si necesitas usar workerID dentro del handler, puedes pasar una closure
-	// mux.HandleFunc("POST /tasks", func(w http.ResponseWriter, r *http.Request) {
-	//     HandleTaskAssignment(w, r, workerID)
-	// })
+	mux.HandleFunc("POST /tasks", HandleTaskAssignment)// Endpoint para recibir tareas
+	mux.HandleFunc("GET /shuffle/", handleShuffleFetch) // Endpoint para servir archivos de Shuffle
+	//TODO: agregar endpoint para heartbeat si es necesario
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("[Worker %s] Servidor iniciado en %s", workerID, addr)
@@ -30,6 +27,29 @@ func StartServer(workerID string, port int) {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("[Worker %s] Error al iniciar servidor: %v", workerID, err)
 	}
+}
+
+// handleShuffleFetch sirve los archivos de salida temporal a otros Workers.
+// URL esperada: /shuffle?path=/tmp/job-abc/output_task.txt_part_0
+func handleShuffleFetch(w http.ResponseWriter, r *http.Request) {
+    // Patrón de URL /shuffle?path=/tmp/ruta/completa/a/archivo.txt
+    query := r.URL.Query()
+    filePath := query.Get("path")
+    
+    if filePath == "" {
+        http.Error(w, "Parámetro 'path' es requerido", http.StatusBadRequest)
+        return
+    }
+
+    log.Printf("[Shuffle Server] Recibida solicitud para servir archivo: %s", filePath)
+
+    // 1. Verificación básica de seguridad (evitar que lean archivos fuera del scope)
+    // En un sistema real, se verificaría que la ruta esté dentro del directorio de trabajo del job.
+    // Por simplicidad académica, asumiremos que la ruta es válida.
+
+    // 2. Servir el archivo directamente
+    // http.ServeFile maneja el streaming, buffers y cierre por nosotros.
+    http.ServeFile(w, r, filePath)
 }
 
 // HandleTaskAssignment recibe la tarea del Master, la ejecuta y reporta el resultado.
