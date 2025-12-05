@@ -14,7 +14,7 @@ func GenerateMapTasks(job common.JobRequest, node common.OperationNode) ([]commo
 		return nil, fmt.Errorf("tipo de operacion no soportada para la fase 2: %s", node.Type)
 	}
 
-	totalTasks := node.Partitions
+	totalTasks := node.NumPartitions
 	if totalTasks <= 0 {
 		return nil, fmt.Errorf("el numero de particiones debe ser mayor a cero")
 	}

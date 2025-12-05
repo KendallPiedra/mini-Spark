@@ -18,7 +18,7 @@ func setupJob(partitions int, opType string) common.JobRequest {
 				Type: opType,
 				UDFName: "test_map_func",
 				Dependencies: nil,
-				Partitions: partitions,
+				NumPartitions: partitions,
 			},
 		},
 	}

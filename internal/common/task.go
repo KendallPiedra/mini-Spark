@@ -21,6 +21,6 @@ type TaskInput struct {
 type TaskOutput struct {
 	Type		  	string `json:"type"` // "file" o "shuffle"
 	Path 		   	string `json:"path"`             // Ruta del archivo o ubicación del shuffle
-	Partitions  	int    `json:"partitions"`      // Número de particiones (si DestinationType=SHUFFLE)
+	NumPartitions  	int    `json:"partitions"`      // Número de particiones (si DestinationType=SHUFFLE)
 	WorkerID      	string `json:"worker_id"`       // ID del shuffle (si DestinationType=SHUFFLE)
 }

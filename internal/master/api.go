@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"mini-spark/internal/common"
 	"mini-spark/internal/storage"
 	"github.com/google/uuid"
-	"strings"
 )
 
 type MasterServer struct {
@@ -16,76 +16,75 @@ type MasterServer struct {
 	Store     *storage.JobStore
 }
 
+// POST /api/v1/jobs
 func (s *MasterServer) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { http.Error(w, "Method not allowed", 405); return }
+
 	var req common.JobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	req.JobID = uuid.New().String()
-	s.Store.SaveJob(&req)
-	
-	fmt.Printf("[Master] Job recibido: %s con %d etapas.\n", req.JobID, len(req.Graph))
-
-	// Iniciar la PRIMERA etapa (Graph[0])
-	firstNode := req.Graph[0]
-	var tasks []common.Task
-	
-	// IMPORTANTE: Definir cuántas particiones tendrá la SIGUIENTE etapa (Reduce)
-	// para que el Map sepa en cuántos buckets dividir.
-	nextPartitions := 1
-	if len(req.Graph) > 1 {
-		nextPartitions = req.Graph[1].Partitions
+		http.Error(w, "Invalid JSON: "+err.Error(), 400); return
 	}
 
-	for i := 0; i < firstNode.Partitions; i++ {
-		tasks = append(tasks, common.Task{
-			TaskID: fmt.Sprintf("%s-%s-%d", req.JobID, firstNode.ID, i),
-			JobID: req.JobID,
-			StageID: firstNode.ID,
-			Operation: firstNode,
-			InputPartition: common.TaskInput{
-				SourceType: common.SourceTypeFile,
-				Path: req.InputPath,
-			},
-			OutputTarget: common.TaskOutput{
-				Type: common.OutputTypeShuffle, // Map siempre hace Shuffle en este modelo
-				Path: fmt.Sprintf("/tmp/mini-spark/%s/%s", req.JobID, firstNode.ID),
-				Partitions: nextPartitions, // Buckets = particiones del Reduce
-			},
-		})
-	}
-	s.Scheduler.SubmitTasks(tasks)
-	
-	json.NewEncoder(w).Encode(map[string]string{"job_id": req.JobID, "status": "SUBMITTED"})
+	if req.JobID == "" { req.JobID = uuid.New().String() }
+	// Si no se especifica particiones globales, usamos un default razonable
+	if req.NumPartitions == 0 { req.NumPartitions = 2 }
+
+	s.Store.CreateJob(&req)
+	s.Scheduler.SubmitJob(&req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"job_id": req.JobID,
+		"status": common.JobStatusAccepted,
+	})
 }
 
+// GET /api/v1/jobs/{id}
+func (s *MasterServer) HandleGetJob(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
+	// Esperamos /api/v1/jobs/{id}, el ID debería ser el último elemento
+	if len(parts) == 0 { http.Error(w, "Bad URL", 400); return }
+	jobID := parts[len(parts)-1]
+
+	job := s.Store.GetJob(jobID)
+	if job == nil { http.Error(w, "Job not found", 404); return }
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(job)
+}
+
+// POST /heartbeat (Internal)
 func (s *MasterServer) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var hb common.Heartbeat
 	if err := json.NewDecoder(r.Body).Decode(&hb); err != nil { return }
 	s.Registry.UpdateHeartbeat(hb)
 }
 
-// En /internal/master/api.go
-
+// POST /report (Internal)
 func (s *MasterServer) HandleReport(w http.ResponseWriter, r *http.Request) {
 	var rep common.TaskReport
 	if err := json.NewDecoder(r.Body).Decode(&rep); err != nil { return }
-	
-	fmt.Printf("[Master] Reporte: Tarea %s [%s] Worker %s\n", rep.TaskID, rep.Status, rep.WorkerID)
-	
-	// YA NO NECESITAMOS PARSEAR STRINGS. Usamos los datos explícitos.
-	jobID := rep.JobID
-	stageID := rep.StageID
 
-	if jobID != "" && stageID != "" {
-		s.Store.SaveTaskReport(jobID, stageID, rep)
-		
-		if rep.Status == common.TaskStatusSuccess {
-			// Notificar al Scheduler que una tarea terminó exitosamente
-			s.Scheduler.OnTaskCompleted(rep, jobID, stageID)
-		}
+	// Persistir reporte para trazabilidad
+	s.Store.AddTaskReport(rep.JobID, rep.StageID, rep)
+	
+	if rep.Status == common.TaskStatusSuccess {
+		// Notificar éxito al Scheduler para que avance el DAG
+		s.Scheduler.HandleTaskCompletion(rep)
 	} else {
-		fmt.Println("[Master] Error: Reporte recibido sin JobID o StageID")
+		// MANEJO DE FALLOS
+		// Buscamos la tarea real en memoria del Scheduler para re-encolarla.
+		// Es vital usar la tarea original porque contiene la definición de la operación (UDF, Inputs).
+		s.Scheduler.mu.Lock()
+		realTask, exists := s.Scheduler.RunningTasks[rep.TaskID]
+		s.Scheduler.mu.Unlock()
+		
+		if exists {
+			s.Scheduler.HandleTaskFailure(realTask, rep.ErrorMsg)
+		} else {
+			// Si no existe, es posible que sea un reporte tardío de una tarea que ya dimos por perdida,
+			// o que el Master se reinició. En este diseño simple, solo logueamos.
+			fmt.Printf("[Master] ALERTA: Reporte de fallo para tarea desconocida (posible timeout previo): %s\n", rep.TaskID)
+		}
 	}
 }

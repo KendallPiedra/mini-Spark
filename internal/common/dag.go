@@ -11,5 +11,5 @@ type OperationNode struct {
 	Type       string `json:"op"` // "op" mapeamos a internal type
 	UDFName    string `json:"fn"` // "fn" mapeamos a internal UDF
 	Key        string `json:"key,omitempty"` // Para reduce/join
-	Partitions int    `json:"-"` // Calculado internamente o config global
+	NumPartitions int    `json:"-"` // Calculado internamente o config global
 }

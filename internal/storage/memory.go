@@ -2,56 +2,73 @@ package storage
 
 import (
 	"sync"
+	"time"
 	"mini-spark/internal/common"
 )
 
+// JobState mantiene el estado en tiempo de ejecución de un Job
+type JobState struct {
+	Request      *common.JobRequest
+	Status       string
+	StartTime    int64
+	StageReports map[string][]common.TaskReport // Map[StageID] -> Reports
+	TaskStatus   map[string]string            // Map[TaskID] -> Status
+}
+
 type JobStore struct {
-	mu           sync.RWMutex
-	Jobs         map[string]*common.JobRequest
-	TaskReports  map[string]common.TaskReport // TaskID -> Report
-	StageReports map[string][]common.TaskReport // StageID -> Lista de reportes
+	mu   sync.RWMutex
+	Jobs map[string]*JobState
 }
 
 func NewJobStore() *JobStore {
 	return &JobStore{
-		Jobs:         make(map[string]*common.JobRequest),
-		TaskReports:  make(map[string]common.TaskReport),
-		StageReports: make(map[string][]common.TaskReport),
+		Jobs: make(map[string]*JobState),
 	}
 }
 
-func (s *JobStore) SaveJob(job *common.JobRequest) {
+func (s *JobStore) CreateJob(req *common.JobRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Jobs[job.JobID] = job
+	s.Jobs[req.JobID] = &JobState{
+		Request:      req,
+		Status:       common.JobStatusAccepted,
+		StartTime:    time.Now().Unix(),
+		StageReports: make(map[string][]common.TaskReport),
+		TaskStatus:   make(map[string]string),
+	}
 }
 
-func (s *JobStore) GetJob(jobID string) *common.JobRequest {
+func (s *JobStore) GetJob(jobID string) *JobState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Jobs[jobID]
 }
 
-func (s *JobStore) SaveTaskReport(jobID, stageID string, report common.TaskReport) {
+func (s *JobStore) UpdateJobStatus(jobID, status string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.TaskReports[report.TaskID] = report
-	if report.Status == common.TaskStatusSuccess {
-		s.StageReports[stageID] = append(s.StageReports[stageID], report)
+	if job, ok := s.Jobs[jobID]; ok {
+		job.Status = status
 	}
 }
 
-// CheckStageComplete verifica si todas las tareas de una etapa han terminado exitosamente
-func (s *JobStore) CheckStageComplete(stageID string, expectedTasks int) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	reports, exists := s.StageReports[stageID]
-	if !exists { return false }
-	return len(reports) == expectedTasks
+func (s *JobStore) AddTaskReport(jobID, stageID string, report common.TaskReport) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.Jobs[jobID]
+	if !ok { return }
+
+	job.TaskStatus[report.TaskID] = report.Status
+	if report.Status == common.TaskStatusSuccess {
+		job.StageReports[stageID] = append(job.StageReports[stageID], report)
+	}
 }
 
-func (s *JobStore) GetStageResults(stageID string) []common.TaskReport {
+func (s *JobStore) GetStageReports(jobID, stageID string) []common.TaskReport {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.StageReports[stageID]
+	if job, ok := s.Jobs[jobID]; ok {
+		return job.StageReports[stageID]
+	}
+	return nil
 }

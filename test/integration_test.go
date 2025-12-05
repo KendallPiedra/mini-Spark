@@ -104,7 +104,7 @@ func TestE2EFlow(t *testing.T) {
 		OutputTarget: common.TaskOutput{
 			Type: common.OutputTypeLocalSpill, 
 			Path: outputBasePath, 
-            Partitions: 1, 
+            NumPartitions: 1, 
 		},
 	}
 

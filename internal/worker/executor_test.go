@@ -49,7 +49,7 @@ func createMockTask(jobID, inputPath, outputPath, opType, udfName, outType strin
 		OutputTarget: common.TaskOutput{
 			Type:       outType,
 			Path:       outputPath,
-			Partitions: partitions,
+			NumPartitions: partitions,
 		},
 	}
 }

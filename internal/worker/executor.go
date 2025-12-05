@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io"
+	//"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
+	//"sync"
 	"time"
 
 	"mini-spark/internal/common"
@@ -99,7 +99,7 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 
 	// Procesar línea por línea
 	scanner := bufio.NewScanner(inputFile)
-	numPartitions := task.OutputTarget.Partitions
+	numPartitions := task.OutputTarget.NumPartitions
 	if numPartitions <= 0 { numPartitions = 1 }
 
 	for scanner.Scan() {
@@ -287,7 +287,7 @@ func createPartitionWriters(task common.Task) (map[int]*bufio.Writer, map[int]*o
 	files := make(map[int]*os.File)
 	paths := make(map[int]string)
 
-	numParts := task.OutputTarget.Partitions
+	numParts := task.OutputTarget.NumPartitions
 	if numParts <= 0 { numParts = 1 }
 
 	for i := 0; i < numParts; i++ {

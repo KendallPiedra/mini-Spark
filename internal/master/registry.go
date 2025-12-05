@@ -4,7 +4,7 @@ import (
 	"log"
 	"sync"
 	"time"
-	"my-mini-spark/internal/common"
+	"mini-spark/internal/common"
 )
 
 const WorkerTimeoutSeconds = 10
