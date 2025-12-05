@@ -29,7 +29,7 @@ const (
 	ShufflePathPrefix = "/shuffle"
 	// REQUERIMIENTO PDF: Límite de tiempo por tarea.
 	// En prod esto vendría en el JobRequest, aquí usamos un default seguro.
-	TaskTimeout       = 10 * time.Second 
+	TaskTimeout       = 60 * time.Second 
 )
 
 // =========================================================
