@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  master:
+    build: .
+    image: mini-spark:latest
+    container_name: master
+    hostname: master
+    ports:
+      - "8080:8080"
+    environment:
+      # Definimos una red interna para los workers
+      - MASTER_ADDRESS=http://master:8080
+    volumes:
+      # Montar la carpeta de datos para que sea visible en el host
+      - ./data:/data
+    # El ENTRYPOINT del Dockerfile inicia el Master por defecto
+
+  worker1:
+    build: .
+    image: mini-spark:latest
+    container_name: worker1
+    hostname: worker1
+    environment:
+      - MASTER_ADDRESS=http://master:8080
+      - WORKER_PORT=8081
+    # Aseguramos que el worker se conecte a la red del master
+    depends_on:
+      - master
+    command: ["/usr/local/bin/worker", "-port", "8081", "-master", "http://master:8080"]
+
+  worker2:
+    build: .
+    image: mini-spark:latest
+    container_name: worker2
+    hostname: worker2
+    environment:
+      - MASTER_ADDRESS=http://master:8080
+      - WORKER_PORT=8082
+    depends_on:
+      - master
+    command: ["/usr/local/bin/worker", "-port", "8082", "-master", "http://master:8080"]
+    
+  client:
+    build: .
+    image: mini-spark:latest
+    container_name: client
+    hostname: client
+    depends_on:
+      - master
+      - worker1
+      - worker2
+    volumes:
+      - ./data:/data
+    # No inicia automáticamente, se usa para interactuar.
+    command: ["tail", "-f", "/dev/null"]

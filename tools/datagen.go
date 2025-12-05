@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"bufio"
 )
 
 func main() {
@@ -45,4 +46,21 @@ func main() {
 	os.WriteFile("data/inputs/users.csv", []byte(usersContent), 0644)
 
 	fmt.Println(" Todos los datos generados exitosamente.")
+
+
+	// 4. DATASET GRANDE (1 Millón de líneas)
+	fmt.Println("Generando data/inputs/big_1m.txt (Esto puede tardar un poco)...")
+	f, err := os.Create("data/inputs/big_1m.txt")
+	if err != nil { panic(err) }
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	line := "sistema operativo distribuido proceso hilo memoria red spark flink\n"
+	
+	// 1,000,000 de líneas
+	for i := 0; i < 1000000; i++ {
+		w.WriteString(line)
+	}
+	w.Flush()
+	fmt.Println("Dataset de 1M generado.")
 }

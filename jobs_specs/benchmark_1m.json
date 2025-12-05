@@ -1,0 +1,24 @@
+{
+  "name": "Benchmark-1M",
+  "path": "data/inputs/big_1m.txt",
+  "partitions": 4,
+  "dag": {
+    "nodes": [
+      {
+        "id": "map-bench",
+        "op_type": "MAP",
+        "udf_name": "map_wordcount",
+        "partitions": 4
+      },
+      {
+        "id": "reduce-bench",
+        "op_type": "REDUCE_BY_KEY",
+        "udf_name": "reduce_sum",
+        "partitions": 2
+      }
+    ],
+    "edges": [
+      ["map-bench", "reduce-bench"]
+    ]
+  }
+}
