@@ -1,0 +1,24 @@
+{
+  "name": "Demo-WordCount",
+  "path": "data/inputs/wordcount.txt",
+  "partitions": 2,
+  "dag": {
+    "nodes": [
+      {
+        "id": "map-wc",
+        "op_type": "MAP",
+        "udf_name": "map_wordcount",
+        "partitions": 2
+      },
+      {
+        "id": "reduce-wc",
+        "op_type": "REDUCE_BY_KEY",
+        "udf_name": "reduce_sum",
+        "partitions": 2
+      }
+    ],
+    "edges": [
+      ["map-wc", "reduce-wc"]
+    ]
+  }
+}

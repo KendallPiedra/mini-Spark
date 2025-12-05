@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,137 +13,107 @@ import (
 	"mini-spark/internal/common"
 )
 
-// URL del Master
-const MasterURL = "http://localhost:8080"
+// Configuración
+var (
+	masterURL  string
+	submitFile string
+	jobIDArg   string
+	poll       bool
+)
 
 func main() {
-	fmt.Println("--- INICIANDO CLIENTE MINI-SPARK (JOIN TEST) ---")
+	// Definir argumentos de línea de comandos
+	flag.StringVar(&masterURL, "master", "http://localhost:8080", "URL del Master")
+	flag.StringVar(&submitFile, "submit", "", "Ruta al archivo JSON con la definición del Job")
+	flag.StringVar(&jobIDArg, "status", "", "Consultar estado de un Job ID específico")
+	flag.BoolVar(&poll, "watch", false, "Si se usa con -submit o -status, se queda monitoreando hasta finalizar")
+	flag.Parse()
 
-	// 1. Generar datos de prueba (Simulando dos tablas: Usuarios y Órdenes)
-	inputPath := "/tmp/input_join.txt"
-	createJoinData(inputPath)
-
-	// 2. Definir el Job con estructura DAG para un JOIN
-	job := common.JobRequest{
-		Name:       "Join-Users-Orders",
-		InputPath:  inputPath,
-		NumPartitions: 2, // Paralelismo global
-		DAG: common.DAG{
-			Nodes: []common.OperationNode{
-				// NODO 1: MAP
-				// Lee el archivo mixto y etiqueta: "L:" para usuarios, "R:" para órdenes.
-				{
-					ID:            "stage-map-parse",
-					Type:          common.OpTypeMap, 
-					UDFName:       "map_parse_tables", 
-					NumPartitions: 2,
-				},
-				// NODO 2: JOIN
-				// Recibe datos barajados (Shuffle) por ID y cruza L con R.
-				{
-					ID:            "stage-join",
-					Type:          common.OpTypeJoin, 
-					UDFName:       "join_users_orders",
-					NumPartitions: 2,
-				},
-			},
-			// Definimos la dependencia: Map -> Join
-			Edges: [][]string{
-				{"stage-map-parse", "stage-join"},
-			},
-		},
+	// MODO 1: Consultar Estado
+	if jobIDArg != "" {
+		checkStatus(jobIDArg)
+		if poll {
+			monitorJob(jobIDArg)
+		}
+		return
 	}
 
-	// 3. Enviar el Job al Master
-	fmt.Println("🚀 Enviando Job al Master...")
-	jobID := submitJob(job)
-	fmt.Printf("✅ Job aceptado con ID: %s\n", jobID)
+	// MODO 2: Enviar Job
+	if submitFile != "" {
+		// Leer el archivo JSON
+		jsonBytes, err := os.ReadFile(submitFile)
+		if err != nil {
+			panic(fmt.Sprintf("No se pudo leer el archivo %s: %v", submitFile, err))
+		}
 
-	// 4. Monitorear el estado hasta que termine
-	monitorJob(jobID)
-}
+		// Validar que sea un JSON válido (opcional, pero recomendado)
+		var jobReq common.JobRequest
+		if err := json.Unmarshal(jsonBytes, &jobReq); err != nil {
+			panic(fmt.Sprintf("El archivo no es un JobRequest válido: %v", err))
+		}
 
-// --- FUNCIONES AUXILIARES ---
+		fmt.Printf(" Enviando Job: %s (desde %s)\n", jobReq.Name, submitFile)
+		jobID := submitJob(jsonBytes)
+		fmt.Printf(" Job aceptado con ID: %s\n", jobID)
 
-func createJoinData(path string) {
-	// Generamos un archivo CSV mixto
-	// Formato Usuarios: U,ID,Nombre
-	// Formato Órdenes:  O,OrderID,UserID,Producto
-	content := ""
-	
-	// Usuarios
-	content += "U,1,Juan\n"
-	content += "U,2,Maria\n"
-	content += "U,3,Pedro\n"
-	content += "U,4,Ana\n"
-	
-	// Pedidos
-	content += "O,100,1,Laptop\n"   // Juan compró Laptop
-	content += "O,101,1,Mouse\n"    // Juan compró Mouse
-	content += "O,102,2,Monitor\n"  // Maria compró Monitor
-	content += "O,103,4,Teclado\n"  // Ana compró Teclado
-	content += "O,104,4,Webcam\n"   // Ana compró Webcam
-	// Pedro no compró nada (no aparecerá en el Join)
-
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		panic(fmt.Sprintf("Error creando archivo de datos: %v", err))
+		if poll {
+			monitorJob(jobID)
+		}
+		return
 	}
-	fmt.Printf("📝 Datos de prueba creados en %s\n", path)
+
+	// Si no hay argumentos
+	fmt.Println("Uso del Cliente:")
+	fmt.Println("  Enviar Job:      go run cmd/client/main.go -submit jobs_specs/wordcount.json -watch")
+	fmt.Println("  Consultar Job:   go run cmd/client/main.go -status <JOB_ID>")
+	flag.PrintDefaults()
 }
 
-func submitJob(job common.JobRequest) string {
-	data, _ := json.Marshal(job)
-	resp, err := http.Post(MasterURL+"/api/v1/jobs", "application/json", bytes.NewBuffer(data))
+func submitJob(data []byte) string {
+	resp, err := http.Post(masterURL+"/api/v1/jobs", "application/json", bytes.NewBuffer(data))
 	if err != nil {
-		panic(fmt.Sprintf("Error contactando master: %v. ¿Está encendido?", err))
+		panic(fmt.Sprintf("Error contactando master: %v", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		panic(fmt.Sprintf("Master rechazó job (%d): %s", resp.StatusCode, string(body)))
+		panic(fmt.Sprintf("Master rechazó job: %s", string(body)))
 	}
 
 	var res map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		panic("Error decodificando respuesta del Master")
-	}
+	json.NewDecoder(resp.Body).Decode(&res)
 	return res["job_id"]
 }
 
+func checkStatus(id string) {
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", masterURL, id))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(os.Stdout, resp.Body)
+	fmt.Println() // Salto de línea
+}
+
 func monitorJob(jobID string) {
-	fmt.Println("⏳ Monitoreando estado del Job...")
+	fmt.Println(" Monitoreando...")
 	for {
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", MasterURL, jobID))
-		if err != nil {
-			fmt.Printf("⚠️ Error consultando estado: %v\n", err)
-			break
-		}
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", masterURL, jobID))
+		if err != nil { break }
 		
 		var status map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-			fmt.Println("Error leyendo respuesta de estado")
-			resp.Body.Close()
-			break
-		}
+		json.NewDecoder(resp.Body).Decode(&status)
 		resp.Body.Close()
 
-		// Extraer estado, manejando posibles nulos
-		stateInterface := status["Status"]
-		if stateInterface == nil {
-			fmt.Println("Estado desconocido recibido del Master")
-			break
-		}
-		currentState := stateInterface.(string)
-		
-		fmt.Printf(">> Estado actual: %s\n", currentState)
+		st := status["Status"].(string)
+		fmt.Printf("\r>> Estado: %s   ", st) // \r para sobrescribir línea
 
-		if currentState == "SUCCEEDED" || currentState == "FAILED" {
-			fmt.Println("🏁 Ejecución finalizada.")
+		if st == "SUCCEEDED" || st == "FAILED" {
+			fmt.Println("\n Finalizado.")
 			break
 		}
-		
-		// Esperar un poco antes de volver a consultar
 		time.Sleep(1 * time.Second)
 	}
 }

@@ -7,9 +7,10 @@ type DAG struct {
 }
 
 type OperationNode struct {
-	ID         string `json:"id"`
-	Type       string `json:"op"` // "op" mapeamos a internal type
-	UDFName    string `json:"fn"` // "fn" mapeamos a internal UDF
-	Key        string `json:"key,omitempty"` // Para reduce/join
-	NumPartitions int    `json:"-"` // Calculado internamente o config global
+	ID         string 		`json:"id"`
+	Type       string 		`json:"op_type"` // "op" mapeamos a internal type
+	UDFName    string 		`json:"udf_name"` // "fn" mapeamos a internal UDF
+	Key        string 		`json:"key,omitempty"` // Para reduce/join
+	Dependencies []string 	`json:"dependencies"` // IDs de nodos previos
+	NumPartitions int    	`json:"partitions"` // Calculado internamente o config global
 }

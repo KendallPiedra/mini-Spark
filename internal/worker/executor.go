@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	//"io"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -21,15 +21,13 @@ import (
 // 1. GESTIÓN DEL POOL DE HILOS (WORKER POOL)
 // ==========================================
 
-// ExecutionManager controla la concurrencia en el nodo.
 type ExecutionManager struct {
 	maxThreads int
-	semaphore  chan struct{} // Semáforo para limitar concurrencia
+	semaphore  chan struct{}
 }
 
 var GlobalExecutor *ExecutionManager
 
-// InitExecutor inicializa el pool global con un límite de hilos.
 func InitExecutor(maxThreads int) {
 	GlobalExecutor = &ExecutionManager{
 		maxThreads: maxThreads,
@@ -38,10 +36,9 @@ func InitExecutor(maxThreads int) {
 	log.Printf("[Executor] Inicializado pool con %d hilos", maxThreads)
 }
 
-// Submit intenta ejecutar una tarea. Bloquea si el pool está lleno.
 func (e *ExecutionManager) Submit(task common.Task) ([]common.ShuffleMeta, error) {
-	e.semaphore <- struct{}{} // Adquirir token (bloquea si está lleno)
-	defer func() { <-e.semaphore }() // Liberar token al salir
+	e.semaphore <- struct{}{}
+	defer func() { <-e.semaphore }()
 
 	log.Printf("[Executor] Iniciando tarea %s (Threads activos: %d/%d)", task.TaskID, len(e.semaphore), e.maxThreads)
 	return executeTaskLogic(task)
@@ -66,19 +63,37 @@ func executeTaskLogic(task common.Task) ([]common.ShuffleMeta, error) {
 // LADO MAP (Map, Filter, FlatMap)
 // ------------------------------------------
 func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
-	inputFile, err := os.Open(task.InputPartition.Path)
+	var inputStream io.ReadCloser
+	var err error
+
+	// 1. Determinar Fuente de Entrada (Archivo Local o Shuffle Remoto)
+	if task.InputPartition.SourceType == common.SourceTypeShuffle {
+		// Caso Especial: Etapa intermedia (ej. Map después de Filter)
+		// Descargamos todo el shuffle a un archivo temporal para procesarlo linealmente
+		tempPath := fmt.Sprintf("/tmp/shuffle_in_%s.tmp", task.TaskID)
+		if err := downloadShuffleToTemp(task.InputPartition.ShuffleMap, tempPath); err != nil {
+			return nil, fmt.Errorf("error descargando input shuffle: %w", err)
+		}
+		// Abrimos el temp
+		inputStream, err = os.Open(tempPath)
+		// Borramos el temp al terminar
+		defer os.Remove(tempPath)
+	} else {
+		// Caso Normal: Lectura de archivo local (Source)
+		inputStream, err = os.Open(task.InputPartition.Path)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("error leyendo input: %w", err)
 	}
-	defer inputFile.Close()
+	defer inputStream.Close()
 
-	// Preparar escritores particionados (Buckets)
+	// 2. Preparar Writers (Salida)
 	writers, files, paths := createPartitionWriters(task)
 	defer closeWriters(writers, files)
 
-	// Obtener la UDF correspondiente
+	// 3. Obtener UDF
 	var processFn func(udf.Record) []udf.Record
-	
 	switch task.Operation.Type {
 	case common.OpTypeMap:
 		fn, err := udf.GetMapFunction(task.Operation.UDFName)
@@ -97,19 +112,22 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 		}
 	}
 
-	//=================================
-	scanner := bufio.NewScanner(inputFile)
-	//spliting
+	// 4. Procesar
+	scanner := bufio.NewScanner(inputStream)
+	
+	// Configuración de Input Splitting (Solo aplica si leemos de ARCHIVO compartido)
+	// Si viene de Shuffle, procesamos TODO lo que descargamos (ya viene particionado para mí)
+	shouldSplit := (task.InputPartition.SourceType == common.SourceTypeFile)
+	
 	lineCounter := 0
 	totalPartitions := task.Operation.NumPartitions
 	if totalPartitions <= 0 { totalPartitions = 1 }
-	// ---------------------------
 
 	for scanner.Scan() {
-		// FILTRO DE PARTICIÓN
-		if lineCounter % totalPartitions == task.PartitionIndex {
+		// Input Splitting: Si es archivo compartido, solo leo mi parte.
+		// Si es Shuffle, leo todo lo que me mandaron.
+		if !shouldSplit || (lineCounter % totalPartitions == task.PartitionIndex) {
 			
-			// PROCESAR SOLO SI ME TOCA
 			line := scanner.Text()
 			results := processFn(udf.Record(line))
 
@@ -118,6 +136,7 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 				if task.OutputTarget.Type == common.OutputTypeShuffle {
 					partID = getPartitionID(string(res), task.OutputTarget.NumPartitions)
 				}
+				
 				if w, ok := writers[partID]; ok {
 					w.WriteString(string(res) + "\n")
 				}
@@ -126,33 +145,8 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 		lineCounter++
 	}
 
-	// Procesar línea por línea
-	//scanner := bufio.NewScanner(inputFile)
-	numPartitions := task.OutputTarget.NumPartitions
-	if numPartitions <= 0 { numPartitions = 1 }
-
-	for scanner.Scan() {
-		results := processFn(udf.Record(scanner.Text()))
-		for _, res := range results {
-			// Particionamiento Hash
-			partID := 0
-			if task.OutputTarget.Type == common.OutputTypeShuffle {
-				partID = getPartitionID(string(res), numPartitions)
-			}
-			// Escribir al bucket correspondiente
-			if writer, ok := writers[partID]; ok {
-				writer.WriteString(string(res) + "\n")
-			} else {
-				// Lazy creation si falló el setup inicial (safety check)
-				// En esta implementación createPartitionWriters ya crea todo o nada, 
-				// pero aquí podríamos manejar particiones dinámicas.
-			}
-		}
-	}
-
 	if err := scanner.Err(); err != nil { return nil, err }
 
-	// Generar reporte
 	return generateMeta(writers, files, paths)
 }
 
@@ -160,19 +154,19 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 // LADO REDUCE (ReduceByKey, Join)
 // ------------------------------------------
 func executeReduceSide(task common.Task) ([]common.ShuffleMeta, error) {
-	// 1. Descarga (Shuffle Fetch) y Agregación en Memoria con Spill
-	aggregator := NewMemoryAggregator(50 * 1024 * 1024) // 50MB Limite antes de Spill
+	// Agregación en Memoria con Spill
+	aggregator := NewMemoryAggregator(50 * 1024 * 1024) 
 	defer aggregator.Cleanup()
 
-	// Descargar datos de todos los workers remotos
+	// Descargar datos
 	for _, url := range task.InputPartition.ShuffleMap {
 		if err := downloadAndMerge(url, aggregator); err != nil {
-			log.Printf("[Warn] Fallo descargando parte del shuffle %s: %v", url, err)
-			return nil, err // En un sistema real, aquí reintentaríamos
+			log.Printf("[Warn] Fallo parcial shuffle %s: %v", url, err)
+			return nil, err
 		}
 	}
 
-	// 2. Ejecutar Operación Final (Reduce o Join)
+	// Salida
 	outPath := fmt.Sprintf("%s_%s_out", task.OutputTarget.Path, task.TaskID)
 	os.MkdirAll(filepath.Dir(outPath), 0755)
 	outFile, err := os.Create(outPath)
@@ -180,8 +174,7 @@ func executeReduceSide(task common.Task) ([]common.ShuffleMeta, error) {
 	defer outFile.Close()
 	writer := bufio.NewWriter(outFile)
 
-	// Iterar sobre datos agregados
-	dataMap := aggregator.GetDataMap() // Nota: Implementación simplificada sin merge-sort externo completo
+	dataMap := aggregator.GetDataMap()
 
 	if task.Operation.Type == common.OpTypeReduceByKey {
 		reduceFn, err := udf.GetReduceFunction(task.Operation.UDFName)
@@ -195,17 +188,9 @@ func executeReduceSide(task common.Task) ([]common.ShuffleMeta, error) {
 		joinFn, err := udf.GetJoinFunction(task.Operation.UDFName)
 		if err != nil { return nil, err }
 		
-		// Para Join, necesitamos separar valores Left y Right.
-		// Asumimos que el Map anterior etiquetó los datos o usamos una heurística.
-		// SIMPLIFICACIÓN: Asumimos que los valores tienen prefijo "L:" o "R:"
-		// O simplemente pasamos todo a la UDF y ella decide.
 		for key, values := range dataMap {
-			// En un sistema real, el KeyValue tendría metadatos de origen.
-			// Aquí pasamos la lista cruda a una UDF genérica que dividiría manualmente.
-			// Para cumplir el contrato, pasamos 'values' como left y 'nil' como right si no distinguimos,
-			// o implementamos lógica de separación aquí.
-			
-			// Ejemplo dummy: Todos son left
+			// En un sistema real separaríamos Left/Right aqui.
+			// Pasamos todo y la UDF se encarga.
 			results := joinFn(key, values, []string{}) 
 			for _, r := range results {
 				writer.WriteString(string(r) + "\n")
@@ -219,8 +204,39 @@ func executeReduceSide(task common.Task) ([]common.ShuffleMeta, error) {
 }
 
 // ==========================================
-// 3. GESTIÓN DE MEMORIA Y SPILL (Básico)
+// 3. GESTIÓN DE MEMORIA Y HELPERS
 // ==========================================
+
+// Helper nuevo para descargar múltiples fuentes a un solo archivo (Para Map-Shuffle)
+func downloadShuffleToTemp(shuffleMap map[string]string, destPath string) error {
+	f, err := os.Create(destPath)
+	if err != nil { return err }
+	defer f.Close()
+	
+	w := bufio.NewWriter(f)
+
+	for _, url := range shuffleMap {
+		resp, err := http.Get(url)
+		if err != nil { return err } // Fail fast
+		
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			return fmt.Errorf("status %d from %s", resp.StatusCode, url)
+		}
+
+		// Copiar contenido al archivo temp
+		_, err = io.Copy(w, resp.Body)
+		resp.Body.Close()
+		if err != nil { return err }
+		
+		// Asegurar salto de línea entre archivos
+		w.WriteString("\n") 
+	}
+	w.Flush()
+	return nil
+}
+
+// ... (MemoryAggregator y resto de helpers se mantienen igual que la versión anterior) ...
 
 type MemoryAggregator struct {
 	data      map[string][]string
@@ -239,18 +255,13 @@ func NewMemoryAggregator(limit int64) *MemoryAggregator {
 func (m *MemoryAggregator) Add(key, value string) {
 	m.data[key] = append(m.data[key], value)
 	m.sizeBytes += int64(len(key) + len(value))
-	
-	if m.sizeBytes > m.limit {
-		m.SpillToDisk()
-	}
+	if m.sizeBytes > m.limit { m.SpillToDisk() }
 }
 
 func (m *MemoryAggregator) SpillToDisk() {
-	// Implementación básica: Volcar mapa actual a un archivo temp y limpiar RAM
 	tmpName := fmt.Sprintf("/tmp/spill_%d_%d.jsonl", time.Now().UnixNano(), len(m.spillFiles))
 	f, _ := os.Create(tmpName)
 	w := bufio.NewWriter(f)
-	
 	for k, vals := range m.data {
 		for _, v := range vals {
 			kv := common.KeyValue{Key: k, Value: v}
@@ -258,19 +269,13 @@ func (m *MemoryAggregator) SpillToDisk() {
 			w.WriteString(string(b) + "\n")
 		}
 	}
-	w.Flush()
-	f.Close()
-	
+	w.Flush(); f.Close()
 	m.spillFiles = append(m.spillFiles, tmpName)
-	m.data = make(map[string][]string) // Reset memoria
+	m.data = make(map[string][]string)
 	m.sizeBytes = 0
-	log.Printf("[Executor] Spill to disk: %s", tmpName)
 }
 
 func (m *MemoryAggregator) GetDataMap() map[string][]string {
-	// Si hubo spills, deberíamos recargarlos. 
-	// SIMPLIFICACIÓN: Cargamos todo de vuelta a memoria (asumiendo que cabe para el Reduce final).
-	// En prod: Usar External Merge Sort.
 	for _, path := range m.spillFiles {
 		f, _ := os.Open(path)
 		sc := bufio.NewScanner(f)
@@ -288,18 +293,11 @@ func (m *MemoryAggregator) Cleanup() {
 	for _, p := range m.spillFiles { os.Remove(p) }
 }
 
-// ==========================================
-// 4. HELPERS
-// ==========================================
-
 func downloadAndMerge(url string, agg *MemoryAggregator) error {
 	resp, err := http.Get(url)
 	if err != nil { return err }
 	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("status %d from %s", resp.StatusCode, url)
-	}
+	if resp.StatusCode != 200 { return fmt.Errorf("status %d", resp.StatusCode) }
 
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
@@ -315,12 +313,10 @@ func createPartitionWriters(task common.Task) (map[int]*bufio.Writer, map[int]*o
 	writers := make(map[int]*bufio.Writer)
 	files := make(map[int]*os.File)
 	paths := make(map[int]string)
-
 	numParts := task.OutputTarget.NumPartitions
 	if numParts <= 0 { numParts = 1 }
 
 	for i := 0; i < numParts; i++ {
-		// Nombre: /ruta/base_TaskID_part_N
 		p := fmt.Sprintf("%s_%s_part_%d", task.OutputTarget.Path, task.TaskID, i)
 		os.MkdirAll(filepath.Dir(p), 0755)
 		f, _ := os.Create(p)
@@ -357,5 +353,5 @@ func getPartitionID(jsonLine string, numPartitions int) int {
 		h.Write([]byte(kv.Key))
 		return int(h.Sum32()) % numPartitions
 	}
-	return 0 // Fallback
+	return 0
 }

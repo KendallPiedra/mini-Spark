@@ -1,0 +1,24 @@
+{
+  "name": "Demo-Join",
+  "path": "data/inputs/join_data.txt",
+  "partitions": 2,
+  "dag": {
+    "nodes": [
+      {
+        "id": "map-parse",
+        "op_type": "MAP",
+        "udf_name": "map_parse_tables",
+        "partitions": 2
+      },
+      {
+        "id": "join-op",
+        "op_type": "JOIN",
+        "udf_name": "join_users_orders",
+        "partitions": 2
+      }
+    ],
+    "edges": [
+      ["map-parse", "join-op"]
+    ]
+  }
+}

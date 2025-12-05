@@ -1,0 +1,31 @@
+{
+  "name": "Demo-Filter-Adults",
+  "path": "data/inputs/users.csv",
+  "partitions": 2,
+  "dag": {
+    "nodes": [
+      {
+        "id": "filter-age",
+        "op_type": "FILTER",
+        "udf_name": "filter_adults",
+        "partitions": 2
+      },
+      {
+        "id": "map-prep",
+        "op_type": "MAP",
+        "udf_name": "map_identity",
+        "partitions": 2
+      },
+      {
+        "id": "reduce-count",
+        "op_type": "REDUCE_BY_KEY",
+        "udf_name": "reduce_sum",
+        "partitions": 1
+      }
+    ],
+    "edges": [
+      ["filter-age", "map-prep"],
+      ["map-prep", "reduce-count"]
+    ]
+  }
+}

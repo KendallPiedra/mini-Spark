@@ -124,6 +124,22 @@ var UDFRegistry = map[string]interface{}{
 		}
 		return results
 	}),
+	// Filtra CSV donde la edad (columna 2) sea >= 18
+    "filter_adults": UDFFilterFn(func(r Record) bool {
+        parts := strings.Split(string(r), ",")
+        if len(parts) < 3 || parts[0] == "ID" { return false } // Header o error
+        var age int
+        fmt.Sscanf(parts[2], "%d", &age)
+        return age >= 18
+    }),
+    // Identidad: Pasa el registro tal cual (útil para encadenar)
+    "map_identity": UDFMapFn(func(r Record) []Record {
+        // Retornamos clave "keep" para agrupar todo o el mismo contenido
+        // Para simplificar, usamos el contenido como clave
+        kv := common.KeyValue{Key: "adultos", Value: string(r)}
+        b, _ := json.Marshal(kv)
+        return []Record{Record(b)}
+    }),
 }
 
 // Helpers para obtener funciones con cast seguro
