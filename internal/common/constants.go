@@ -18,7 +18,8 @@ const (
 
 // Tipos de Destino de Datos (TaskOutput.Type)
 	OutputTypeLocalSpill = "LOCAL_SPILL"  // Escribir en archivo temporal del Worker
-	OutputTypeFinal      = "FINAL_OUTPUT" // Escribir en el OutputPath final
+	OutputTypeShuffle    = "SHUFFLE"     // Salida particionada (N archivos)
+	//OutputTypeFinal      = "FINAL_OUTPUT" // Escribir en el OutputPath final
 
 // Estados de un Worker (Heartbeat.Status)
 	WorkerStatusIdle = "IDLE"
@@ -30,6 +31,5 @@ const (
 	TaskStatusRetryNeeded = "RETRY_NEEDED"
 
 // Tipos de Destino
-	OutputTypeShuffle    = "SHUFFLE"     // Salida particionada (N archivos)
 )
 

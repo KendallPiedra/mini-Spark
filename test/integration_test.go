@@ -3,40 +3,57 @@ package integration_test
 import (
 	"bytes"
 	"encoding/json"
-	//"fmt"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"os"     // Usado por helpers
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync"   // Usado por MasterMock
 	"testing"
+
 	"mini-spark/internal/common"
 	"mini-spark/internal/worker"
 )
 
-// 1. Mock del Master
+// ==========================================================
+//                 HELPER FUNCTIONS & MOCKS
+// ==========================================================
+
+// MasterMock simula el Master recibiendo el reporte del Worker
 type MasterMock struct {
-	ReportMutex    sync.Mutex
 	ReceivedReport *common.TaskReport
-	Server         *httptest.Server
+	ReportMutex    sync.Mutex
 }
 
+// handleReport es el handler de red del Master Mock
 func (m *MasterMock) handleReport(w http.ResponseWriter, r *http.Request) {
+	m.ReportMutex.Lock()
+	defer m.ReportMutex.Unlock()
+
 	var report common.TaskReport
 	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
-		http.Error(w, "JSON invalido", http.StatusBadRequest)
+		http.Error(w, "JSON de reporte invalido", http.StatusBadRequest)
 		return
 	}
-
-	m.ReportMutex.Lock()
 	m.ReceivedReport = &report
-	m.ReportMutex.Unlock()
-
 	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "Reporte recibido")
 }
 
-// Helper necesario (añadido porque faltaba en tu versión anterior)
+// createInputFile crea un archivo temporal para el input de la tarea.
+func createInputFile(t *testing.T, dir, filename, content string) string {
+	path := filepath.Join(dir, filename)
+	// Normalizamos saltos de línea
+	content = strings.ReplaceAll(content, "\n", "\n")
+	err := os.WriteFile(path, []byte(content), 0644)
+	if err != nil {
+		t.Fatalf("No se pudo crear input: %v", err)
+	}
+	return path
+}
+
+// readOutputFile lee el contenido de un archivo dado su path.
 func readOutputFile(t *testing.T, path string) string {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -45,34 +62,33 @@ func readOutputFile(t *testing.T, path string) string {
 	return string(content)
 }
 
-func createInputFile(t *testing.T, dir, filename, content string) string {
-	path := filepath.Join(dir, filename)
-	err := os.WriteFile(path, []byte(content), 0644)
-	if err != nil {
-		t.Fatalf("No se pudo crear el archivo de entrada: %v", err)
-	}
-	return path
-}
-
 // Helper para crear request de reporte (para el mock)
 func createReportRequest(report common.TaskReport) *http.Request {
-    reportJSON, _ := json.Marshal(report)
-    return httptest.NewRequest("POST", "/report", bytes.NewBuffer(reportJSON))
+	reportJSON, _ := json.Marshal(report)
+	return httptest.NewRequest("POST", "/report", bytes.NewBuffer(reportJSON))
 }
 
+// ==========================================================
+//                     TEST CASE
+// ==========================================================
+
+// TestE2EFlow verifica un flujo simple de asignación, ejecución y reporte de una tarea MAP.
 func TestE2EFlow(t *testing.T) {
 	// Setup Master Mock
 	masterMock := &MasterMock{}
-	// No necesitamos arrancar el servidor HTTP del Master Mock porque interceptaremos
-	// la llamada directamente, pero es buena práctica tener la estructura.
 
-	// Setup Entorno
+	// Setup Entorno de archivos temporales
 	tempDir := t.TempDir()
 	inputContent := "dato uno\ndato dos\n"
-	expectedOutputContent := "DATO UNO\nDATO DOS\n" // Ojo con los saltos de línea
+	expectedOutputContent := "DATO UNO\nDATO DOS\n" 
 
 	inputPath := createInputFile(t, tempDir, "input.txt", inputContent)
-	outputPath := filepath.Join(tempDir, "output_task.txt")
+	
+	// Ruta BASE que la tarea usa
+	outputBasePath := filepath.Join(tempDir, "output_task.txt") 
+    
+    // Ruta REAL esperada que crea el Executor para una salida simple (_part_0)
+    expectedReportPath := outputBasePath + "_part_0" 
 
 	task := common.Task{
 		TaskID: "task-123",
@@ -86,46 +102,35 @@ func TestE2EFlow(t *testing.T) {
 			Path:       inputPath,
 		},
 		OutputTarget: common.TaskOutput{
-			Type: common.OutputTypeLocalSpill,
-			Path: outputPath,
+			Type: common.OutputTypeLocalSpill, 
+			Path: outputBasePath, 
+            Partitions: 1, 
 		},
 	}
 
-	// --- MOCKING (Interceptar la red) ---
-	
-	// Guardamos la función original para restaurarla al final
+	// --- MOCKING (Interceptar la red de reporte) ---
 	originalReportFn := worker.ReportToMaster
-	
-	// Sobrescribimos la variable ReportToMaster.
-	// Ahora, en lugar de ir a la red, llama a nuestro MasterMock directamente.
 	worker.ReportToMaster = func(report common.TaskReport) error {
-		// Simulamos la llamada HTTP recibida por el Master
 		req := createReportRequest(report)
 		w := httptest.NewRecorder()
 		masterMock.handleReport(w, req)
 		return nil
 	}
-	// Restaurar siempre al terminar el test
 	defer func() { worker.ReportToMaster = originalReportFn }()
 
-	// --- EJECUCIÓN ---
-
-	// Simulamos que llega la petición HTTP al Worker
+	// --- EJECUCIÓN (Llamar al handler del Worker directamente) ---
 	taskJSON, _ := json.Marshal(task)
 	req := httptest.NewRequest("POST", "/tasks", bytes.NewBuffer(taskJSON))
 	rr := httptest.NewRecorder()
-
-	// Llamamos al handler del Worker directamente
-	worker.HandleTaskAssignment(rr, req)
+	
+	worker.HandleTaskAssignment(rr, req) 
 
 	// --- VERIFICACIÓN ---
 
-	// 1. El Worker respondió 200 OK?
 	if rr.Code != http.StatusOK {
 		t.Fatalf("Worker devolvió error HTTP: %d Body: %s", rr.Code, rr.Body.String())
 	}
 
-	// 2. El Master recibió el reporte?
 	masterMock.ReportMutex.Lock()
 	report := masterMock.ReceivedReport
 	masterMock.ReportMutex.Unlock()
@@ -134,18 +139,19 @@ func TestE2EFlow(t *testing.T) {
 		t.Fatal("El Master Mock no recibió ningún reporte.")
 	}
 
+    // 1. Verificar Estado
 	if report.Status != common.TaskStatusSuccess {
-		t.Errorf("Estado incorrecto. Esperado SUCCESS, Recibido %s. Error: %s", report.Status, report.ErrorMessage)
+		t.Fatalf("Estado incorrecto. Esperado %s, Recibido %s. Error: %s", common.TaskStatusSuccess, report.Status, report.ErrorMsg)
 	}
 	
-	if report.OutputPath != outputPath {
-		t.Errorf("Path incorrecto en reporte. Esperado %s, Recibido %s", outputPath, report.OutputPath)
+    // 2. Verificar Ruta Reportada
+	if report.OutputPath != expectedReportPath {
+		t.Errorf("Path incorrecto en reporte.\nEsperado: %s\nRecibido: %s", expectedReportPath, report.OutputPath)
 	}
 
-	// 3. El archivo se creó correctamente?
-	actualOutput := readOutputFile(t, outputPath)
+	// 3. Verificar Contenido
+	actualOutput := readOutputFile(t, report.OutputPath)
 	
-	// Normalización básica de saltos de linea
 	expected := strings.TrimSpace(expectedOutputContent)
 	actual := strings.TrimSpace(actualOutput)
 

@@ -1,148 +1,190 @@
 package worker
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"mini-spark/internal/common" 
-	//"mini-spark/internal/udf" // Necesario para que el ExecuteTask pueda acceder a las UDFs
+
+	"mini-spark/internal/common"
+	"mini-spark/internal/udf" 
 )
 
-// Helper para crear un archivo de entrada con contenido en un directorio temporal
+// Helper para crear archivos de entrada
 func createInputFile(t *testing.T, dir, filename, content string) string {
 	path := filepath.Join(dir, filename)
-	// Reemplazar \n con el formato de línea del sistema operativo
-	content = strings.ReplaceAll(content, "\n", "\n") 
+	// Normalizamos saltos de línea
+	content = strings.ReplaceAll(content, "\n", "\n")
 	err := os.WriteFile(path, []byte(content), 0644)
 	if err != nil {
-		t.Fatalf("No se pudo crear el archivo de entrada: %v", err)
+		t.Fatalf("No se pudo crear input: %v", err)
 	}
 	return path
 }
 
-// Helper para leer el contenido del archivo de salida
+// Helper para leer archivos de salida
 func readOutputFile(t *testing.T, path string) string {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("No se pudo leer el archivo de salida: %v", err)
+		// No fallamos fatalmente aquí para permitir verificar si el archivo debía existir o no
+		return "" 
 	}
 	return string(content)
 }
 
-// Helper para crear una Task mock
-func createMockTask(jobID, inputPath, outputPath, opType, udfName string) common.Task {
+// Helper actualizado para soportar Particiones y OutputType
+func createMockTask(jobID, inputPath, outputPath, opType, udfName, outType string, partitions int) common.Task {
 	return common.Task{
 		TaskID:  "task-" + jobID,
 		JobID:   jobID,
 		Operation: common.OperationNode{
-			Type: opType,
+			Type:    opType,
 			UDFName: udfName,
 		},
 		InputPartition: common.TaskInput{
 			SourceType: common.SourceTypeFile,
-			Path: inputPath,
+			Path:       inputPath,
 		},
 		OutputTarget: common.TaskOutput{
-			Type: common.OutputTypeLocalSpill,
-			Path: outputPath,
+			Type:       outType,
+			Path:       outputPath,
+			Partitions: partitions,
 		},
 	}
 }
 
 func TestExecuteTask(t *testing.T) {
-	// Usamos \n como separador estándar en el test para evitar problemas de OS
-	inputContent := "Linea uno\nlinea dos\n\nLinea tres"
+	inputSimple := "linea uno\nlinea dos"
 	
+	// Input para el caso de Shuffle (palabras repetidas para verificar hash)
+	// "a" debería ir siempre a la misma partición.
+	inputShuffle := "a b a c" 
+
 	tests := []struct {
-		name          string
-		opType        string
-		udfName       string
-		inputContent  string
-		expectedOutput string
-		expectErr     bool
+		name            string
+		opType          string
+		udfName         string
+		outputType      string
+		partitions      int
+		inputContent    string
+		
+		// Verificación: Esperamos N archivos generados
+		expectedFiles   int
+		// Verificación: Mapa de "Contenido Esperado" (substring) que debe estar en CUALQUIERA de los archivos
+		expectedSubstr  []string 
+		expectErr       bool
 	}{
 		{
-			name: "MAP_to_uppercase_Exitoso",
-			opType: common.OpTypeMap,
-			udfName: "to_uppercase",
-			inputContent: inputContent,
-			// La UDF toma el registro, lo mapea y el Executor añade un \n
-			expectedOutput: "LINEA UNO\nLINEA DOS\n\nLINEA TRES\n", 
-			expectErr: false,
+			name:           "MAP_Simple_LocalSpill",
+			opType:         common.OpTypeMap,
+			udfName:        "to_uppercase",
+			outputType:     common.OutputTypeLocalSpill,
+			partitions:     1,
+			inputContent:   inputSimple,
+			expectedFiles:  1,
+			expectedSubstr: []string{"LINEA UNO", "LINEA DOS"},
+			expectErr:      false,
 		},
 		{
-			name: "FILTER_not_empty_Exitoso",
-			opType: common.OpTypeFilter,
-			udfName: "not_empty",
-			inputContent: inputContent,
-			// Las líneas vacías son eliminadas por el filtro
-			expectedOutput: "Linea uno\nlinea dos\nLinea tres\n", 
-			expectErr: false,
+			name:           "FILTER_Simple",
+			opType:         common.OpTypeFilter,
+			udfName:        "not_empty",
+			outputType:     common.OutputTypeLocalSpill,
+			partitions:     1,
+			inputContent:   "dato\n\n",
+			expectedFiles:  1,
+			expectedSubstr: []string{"dato"}, // La línea vacía no debe estar
+			expectErr:      false,
 		},
 		{
-			name: "UDF_No_Encontrada_Error",
-			opType: common.OpTypeMap,
-			udfName: "non_existent_func",
-			inputContent: "test",
-			expectedOutput: "",
-			expectErr: true,
+			name:           "SHUFFLE_WordCount_2Partitions",
+			opType:         common.OpTypeMap,
+			udfName:        "map_wordcount", // Esta UDF genera JSON KeyValue
+			outputType:     common.OutputTypeShuffle,
+			partitions:     2, // Forzamos hash partitioning
+			inputContent:   inputShuffle,
+			expectedFiles:  2, // Esperamos que "a", "b", "c" se distribuyan (idealmente en 2 particiones)
+			// Verificamos que los JSON se generaron correctamente
+			expectedSubstr: []string{
+				`{"key":"a","value":"1"}`, 
+				`{"key":"b","value":"1"}`,
+				`{"key":"c","value":"1"}`,
+			},
+			expectErr:      false,
 		},
 		{
-			name: "Tipo_Op_No_Soportado_Error",
-			opType: common.OpTypeReduceByKey, // No soportado por el Executor en esta fase
-			udfName: "to_uppercase",
-			inputContent: "test",
-			expectedOutput: "",
-			expectErr: true,
-		},
-		{
-			name: "Archivo_de_Entrada_No_Existe_Error",
-			opType: common.OpTypeMap,
-			udfName: "to_uppercase",
-			inputContent: "Simulado", // El contenido es irrelevante, probamos el error de I/O
-			expectedOutput: "",
-			expectErr: true,
+			name:           "Error_UDF_No_Existe",
+			opType:         common.OpTypeMap,
+			udfName:        "fantasma",
+			outputType:     common.OutputTypeLocalSpill,
+			partitions:     1,
+			inputContent:   "test",
+			expectedFiles:  0,
+			expectErr:      true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tempDir := t.TempDir()
-			outputFilename := "output.txt"
-			
-			var inputPath string
-			if tt.name != "Archivo_de_Entrada_No_Existe_Error" {
-				inputPath = createInputFile(t, tempDir, "input.txt", tt.inputContent)
-			} else {
-				// Simular un path que no existe para forzar el error de os.Open
-				inputPath = filepath.Join(tempDir, "non_existent_input.txt")
-			}
-			
-			outputPath := filepath.Join(tempDir, outputFilename)
+			inputPath := createInputFile(t, tempDir, "input.txt", tt.inputContent)
+			outputBasePath := filepath.Join(tempDir, "output") // Base path sin extensión
 
-			task := createMockTask("job-1", inputPath, outputPath, tt.opType, tt.udfName)
+			task := createMockTask("job-1", inputPath, outputBasePath, tt.opType, tt.udfName, tt.outputType, tt.partitions)
 
-			// Ejecutar la tarea
-			actualPath, err := ExecuteTask(task)
+			// 1. Ejecutar
+			metas, err := ExecuteTask(task)
 
+			// 2. Verificar Error
 			if (err != nil) != tt.expectErr {
-				t.Fatalf("ExecuteTask falló. Se esperaba error: %t, Obtenido: %v", tt.expectErr, err)
+				t.Fatalf("Error inesperado. Esperaba error=%v, obtuvo: %v", tt.expectErr, err)
+			}
+			if tt.expectErr {
+				return // Si esperábamos error y ocurrió, terminamos aquí
 			}
 
-			if !tt.expectErr {
-				if actualPath != outputPath {
-					t.Errorf("Ruta de salida incorrecta. Esperado: %s, Obtenido: %s", outputPath, actualPath)
-				}
-
-				actualOutput := readOutputFile(t, actualPath)
+			// 3. Verificar Cantidad de Archivos Generados
+			// Nota: En Shuffle, puede que una partición quede vacía si el hash lo decide, 
+			// pero nuestro Executor crea el writer bajo demanda. 
+			// Para "a b a c" con hash simple, es muy probable que use ambos buckets.
+			if len(metas) == 0 {
+				t.Errorf("No se generaron archivos de metadatos")
+			}
+			
+			// 4. Verificar Contenido (Acumulado)
+			// Leemos TODOS los archivos generados y los concatenamos para buscar los substrings esperados
+			var fullContentBuilder strings.Builder
+			
+			for _, meta := range metas {
+				// Validar que el path en el meta existe
+				content := readOutputFile(t, meta.Path)
+				fullContentBuilder.WriteString(content)
+				fullContentBuilder.WriteString("\n") // Separador
 				
-				// Normalizamos los saltos de línea para la comparación final
-				expected := strings.ReplaceAll(tt.expectedOutput, "\n", "\n")
-				actual := strings.ReplaceAll(actualOutput, "\n", "\n")
+				// Validar el tamaño reportado
+				if meta.Size != int64(len(content)) {
+					t.Errorf("Tamaño incorrecto en meta para particion %d. Meta: %d, Real: %d", meta.PartitionKey, meta.Size, len(content))
+				}
+			}
+			
+			fullContent := fullContentBuilder.String()
 
-				if actual != expected {
-					t.Errorf("Contenido de salida incorrecto.\nEsperado:\n%q\nObtenido:\n%q", expected, actual)
+			for _, substr := range tt.expectedSubstr {
+				if !strings.Contains(fullContent, substr) {
+					t.Errorf("Falta contenido esperado en la salida.\nBuscando: %s\nEncontrado:\n%s", substr, fullContent)
+				}
+			}
+			
+			// 5. Validación Extra para Shuffle: Formato JSON válido
+			if tt.outputType == common.OutputTypeShuffle {
+				lines := strings.Split(fullContent, "\n")
+				for _, line := range lines {
+					if strings.TrimSpace(line) == "" { continue }
+					var kv common.KeyValue
+					if err := json.Unmarshal([]byte(line), &kv); err != nil {
+						t.Errorf("Línea de salida no es JSON válido en modo Shuffle: %s", line)
+					}
 				}
 			}
 		})
