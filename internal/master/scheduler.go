@@ -4,141 +4,152 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
-
 	"mini-spark/internal/common"
+	"mini-spark/internal/storage"
 )
 
-// WorkerRegistry almacena el estado de los workers en orden determinista.
-type WorkerRegistry struct {
-	Mu      sync.RWMutex
-	workers map[string]common.Heartbeat
-	order   []string // NUEVO: Slice para mantener el orden determinista
-}
-
-func NewWorkerRegistry() *WorkerRegistry {
-	return &WorkerRegistry{
-		workers: make(map[string]common.Heartbeat),
-		order:   make([]string, 0),
-	}
-}
-
-// RegisterWorker añade o actualiza el worker, y garantiza que su ID esté en la lista de orden.
-func (r *WorkerRegistry) RegisterWorker(w common.Heartbeat) {
-	r.Mu.Lock()
-	defer r.Mu.Unlock()
-	
-	// Si el worker es nuevo, lo añadimos al final del slice 'order'
-	if _, exists := r.workers[w.WorkerID]; !exists {
-		r.order = append(r.order, w.WorkerID)
-	}
-	r.workers[w.WorkerID] = w // Actualizamos el estado del worker
-}
-
-// GetActiveWorkers devuelve una lista de workers disponibles en ORDEN determinista.
-func (r *WorkerRegistry) GetActiveWorkers() []common.Heartbeat {
-	r.Mu.RLock()
-	defer r.Mu.RUnlock()
-	
-	active := make([]common.Heartbeat, 0)
-	
-	// Iteramos sobre el slice 'order' (ordenado) en lugar de sobre el mapa (aleatorio)
-	for _, id := range r.order {
-		w := r.workers[id]
-		if w.Status == common.WorkerStatusIdle {
-			active = append(active, w)
-		}
-	}
-	return active
-}
-
-
-// Scheduler y sus métodos (NewScheduler, EnqueueTasks, getNextWorker, Run, assignTask)
-// El resto del código del Scheduler permanece igual, pero su campo WorkerRegistry
-// ahora usa el orden garantizado en GetActiveWorkers.
 type Scheduler struct {
-	Mu           sync.Mutex
+	mu           sync.Mutex
 	PendingTasks []common.Task
-	WorkerRegistry *WorkerRegistry
-	NextWorkerIdx  int
+	Registry     *WorkerRegistry
+	Store        *storage.JobStore
+	NextWorker   int
 }
 
-func NewScheduler(registry *WorkerRegistry) *Scheduler {
-	return &Scheduler{
-		WorkerRegistry: registry,
-		PendingTasks:   make([]common.Task, 0),
-	}
+func NewScheduler(r *WorkerRegistry, s *storage.JobStore) *Scheduler {
+	return &Scheduler{Registry: r, Store: s, PendingTasks: make([]common.Task, 0)}
 }
 
-func (s *Scheduler) EnqueueTasks(tasks []common.Task) {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
+func (s *Scheduler) SubmitTasks(tasks []common.Task) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.PendingTasks = append(s.PendingTasks, tasks...)
+	fmt.Printf("[Scheduler] %d tareas añadidas a la cola.\n", len(tasks))
 }
 
-func (s *Scheduler) Run() {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+// OnTaskCompleted se llama cuando llega un reporte exitoso
+func (s *Scheduler) OnTaskCompleted(report common.TaskReport, jobID, stageID string) {
+	// 1. Verificar si el Job existe
+	job := s.Store.GetJob(jobID)
+	if job == nil { return }
 
-	for range ticker.C {
-		s.Mu.Lock()
-		if len(s.PendingTasks) == 0 {
-			s.Mu.Unlock()
-			continue
+	// 2. Encontrar qué nodo del grafo es esta etapa
+	var currentNode common.OperationNode
+	var nextNode *common.OperationNode
+	
+	// Lógica simple secuencial: Graph[0] -> Graph[1] -> ...
+	for i, node := range job.Graph {
+		if node.ID == stageID {
+			currentNode = node
+			if i+1 < len(job.Graph) {
+				nextNode = &job.Graph[i+1]
+			}
+			break
 		}
+	}
 
-		worker, err := s.getNextWorker()
-		if err != nil {
-			s.Mu.Unlock()
-			continue
+	// 3. Verificar si la etapa completa terminó
+	if s.Store.CheckStageComplete(stageID, currentNode.Partitions) {
+		fmt.Printf("[Scheduler] Etapa %s completada. Planificando siguiente etapa...\n", stageID)
+		
+		if nextNode != nil {
+			s.createNextStageTasks(job, *nextNode, stageID)
+		} else {
+			fmt.Printf("[Scheduler] JOB %s FINALIZADO CON ÉXITO.\n", jobID)
 		}
-
-		task := s.PendingTasks[0] 
-		s.PendingTasks = s.PendingTasks[1:] 
-		s.Mu.Unlock() 
-
-		err = s.assignTask(task, worker)
-		if err != nil {
-			s.Mu.Lock()
-			// Insertar al principio para reintento inmediato
-			s.PendingTasks = append([]common.Task{task}, s.PendingTasks...) 
-			s.Mu.Unlock()
-			fmt.Printf("[Scheduler] Error asignando tarea %s a %s: %v. Reintentando...\n", task.TaskID, worker.Address, err)
-			continue
-		}
-
-		fmt.Printf("[Scheduler] Tarea %s asignada exitosamente a Worker %s\n", task.TaskID, worker.WorkerID)
 	}
 }
 
-func (s *Scheduler) getNextWorker() (*common.Heartbeat, error) {
-	workers := s.WorkerRegistry.GetActiveWorkers()
+// createNextStageTasks genera las tareas de REDUCE basándose en los resultados de MAP
+func (s *Scheduler) createNextStageTasks(job *common.JobRequest, nextNode common.OperationNode, prevStageID string) {
+	prevReports := s.Store.GetStageResults(prevStageID)
+	var newTasks []common.Task
+
+	// Para cada partición de la NUEVA etapa (ej. 2 Reducers)
+	for i := 0; i < nextNode.Partitions; i++ {
+		// Construir el ShuffleMap: ¿Dónde están los datos para la partición 'i'?
+		shuffleMap := make(map[string]string)
+		
+		for _, rep := range prevReports {
+			for _, meta := range rep.ShuffleOutput {
+				// Si este archivo pertenece a la partición 'i'
+				if meta.PartitionKey == i {
+					// Construimos la URL para que el Worker descargue el archivo
+					// Formato: http://WorkerIP:Port/shuffle?path=/ruta/al/archivo
+					url := fmt.Sprintf("http://%s/shuffle?path=%s", rep.WorkerID, meta.Path)
+					// Usamos una clave única para el mapa
+					key := fmt.Sprintf("%s-%d", rep.WorkerID, len(shuffleMap))
+					shuffleMap[key] = url
+				}
+			}
+		}
+
+		newTask := common.Task{
+			TaskID:    fmt.Sprintf("%s-%s-%d", job.JobID, nextNode.ID, i),
+			JobID:     job.JobID,
+			StageID:   nextNode.ID,
+			Operation: nextNode,
+			InputPartition: common.TaskInput{
+				SourceType: common.SourceTypeShuffle, // Indicar que debe descargar
+				ShuffleMap: shuffleMap,
+			},
+			OutputTarget: common.TaskOutput{
+				Type:       common.OutputTypeLocalSpill, // Salida final del Reduce
+				Path:       fmt.Sprintf("%s/%s", job.OutputPath, nextNode.ID),
+				Partitions: 1, 
+			},
+		}
+		newTasks = append(newTasks, newTask)
+	}
+	
+	s.SubmitTasks(newTasks)
+}
+
+func (s *Scheduler) Start() {
+	go func() {
+		for {
+			time.Sleep(100 * time.Millisecond)
+			s.scheduleLoop()
+		}
+	}()
+}
+
+func (s *Scheduler) scheduleLoop() {
+	s.mu.Lock()
+	if len(s.PendingTasks) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	
+	workers := s.Registry.GetIdleWorkers()
 	if len(workers) == 0 {
-		return nil, fmt.Errorf("no hay workers activos disponibles")
+		s.mu.Unlock()
+		return
 	}
 
-	worker := workers[s.NextWorkerIdx%len(workers)]
-	s.NextWorkerIdx++ 
-	return &worker, nil
+	task := s.PendingTasks[0]
+	worker := workers[s.NextWorker%len(workers)]
+	s.NextWorker++
+
+	s.PendingTasks = s.PendingTasks[1:]
+	s.mu.Unlock()
+
+	if err := s.assignTask(task, worker); err != nil {
+		fmt.Printf("[Scheduler] Fallo asignando %s a %s. Reintentando.\n", task.TaskID, worker.Address)
+		s.SubmitTasks([]common.Task{task})
+	} else {
+		fmt.Printf("[Scheduler] Asignada %s -> %s\n", task.TaskID, worker.Address)
+	}
 }
 
-func (s *Scheduler) assignTask(task common.Task, worker *common.Heartbeat) error {
-	taskJSON, err := json.Marshal(task)
-	if err != nil {
-		return err
-	}
-	url := fmt.Sprintf("http://%s/tasks", worker.Address)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(taskJSON))
-	if err != nil {
-		return err
-	}
+func (s *Scheduler) assignTask(t common.Task, w common.Heartbeat) error {
+	data, _ := json.Marshal(t)
+	resp, err := http.Post("http://"+w.Address+"/tasks", "application/json", bytes.NewBuffer(data))
+	if err != nil { return err }
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("worker %s devolvio status %d: %s", worker.WorkerID, resp.StatusCode, string(body))
-	}
+	if resp.StatusCode != 200 { return fmt.Errorf("status %d", resp.StatusCode) }
 	return nil
 }

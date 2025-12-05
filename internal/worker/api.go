@@ -1,136 +1,205 @@
 package worker
 
 import (
-	"bytes" // Necesario para el buffer en http.Post
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"runtime" // NECESARIO PARA MÉTRICAS REALES
+	"sync/atomic"
 	"time"
+
 	"mini-spark/internal/common"
 )
 
-// MasterAddress es la dirección del Master. Usamos una variable (var)
-// para que pueda ser modificada en las pruebas de integración.
-var MasterAddress = "http://localhost:8080"
+// =========================================================
+// VARIABLES GLOBALES Y CONFIGURACIÓN
+// =========================================================
 
-// StartServer inicia el servidor HTTP del Worker.
-func StartServer(workerID string, port int) {
+var (
+	MasterURL   string
+	MyID        string
+	activeTasks int32
+)
+
+// Constantes de configuración
+const (
+	HeartbeatInterval = 3 * time.Second
+	ShufflePathPrefix = "/shuffle"
+	// REQUERIMIENTO PDF: Límite de tiempo por tarea.
+	// En prod esto vendría en el JobRequest, aquí usamos un default seguro.
+	TaskTimeout       = 10 * time.Second 
+)
+
+// =========================================================
+// INICIO DEL SERVIDOR
+// =========================================================
+
+func StartServer(port int, masterAddress string) {
+	MasterURL = masterAddress
+	MyID = fmt.Sprintf("localhost:%d", port)
+
+	// Inicializar el Ejecutor con 4 hilos (Requerimiento: Pool Configurable)
+	InitExecutor(4)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tasks", HandleTaskAssignment)// Endpoint para recibir tareas
-	mux.HandleFunc("GET /shuffle/", handleShuffleFetch) // Endpoint para servir archivos de Shuffle
-	//TODO: agregar endpoint para heartbeat si es necesario
-
-	addr := fmt.Sprintf(":%d", port)
-	log.Printf("[Worker %s] Servidor iniciado en %s", workerID, addr)
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("[Worker %s] Error al iniciar servidor: %v", workerID, err)
-	}
-}
-
-// handleShuffleFetch sirve los archivos de salida temporal a otros Workers.
-// URL esperada: /shuffle?path=/tmp/job-abc/output_task.txt_part_0
-func handleShuffleFetch(w http.ResponseWriter, r *http.Request) {
-    // Patrón de URL /shuffle?path=/tmp/ruta/completa/a/archivo.txt
-    query := r.URL.Query()
-    filePath := query.Get("path")
-    
-    if filePath == "" {
-        http.Error(w, "Parámetro 'path' es requerido", http.StatusBadRequest)
-        return
-    }
-
-    log.Printf("[Shuffle Server] Recibida solicitud para servir archivo: %s", filePath)
-
-    // 1. Verificación básica de seguridad (evitar que lean archivos fuera del scope)
-    // En un sistema real, se verificaría que la ruta esté dentro del directorio de trabajo del job.
-    // Por simplicidad académica, asumiremos que la ruta es válida.
-
-    // 2. Servir el archivo directamente
-    // http.ServeFile maneja el streaming, buffers y cierre por nosotros.
-    http.ServeFile(w, r, filePath)
-}
-
-// HandleTaskAssignment recibe la tarea del Master, la ejecuta y reporta el resultado.
-// Es exportada (mayúscula) para ser llamada directamente en tests de integración.
-func HandleTaskAssignment(w http.ResponseWriter, r *http.Request) {
-	var task common.Task
-
-	// Asumimos un WorkerID estático por ahora, debe ser el real en producción
-	const workerID = "WORKER_ID_PENDIENTE" 
+	mux.HandleFunc("POST /tasks", HandleTaskAssignment)
+	mux.HandleFunc("GET "+ShufflePathPrefix, handleShuffleFetch)
 	
-	// 1. Deserializar la Tarea
-	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
-		http.Error(w, "JSON invalido de la tarea", http.StatusBadRequest)
-		return
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Worker %s ONLINE. Tasks: %d", MyID, atomic.LoadInt32(&activeTasks))
+	})
+
+	go startHeartbeatLoop()
+
+	log.Printf("[Worker %s] Listo en :%d (Pool: 4 threads, Timeout: %s)", MyID, port, TaskTimeout)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), mux); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// =========================================================
+// HANDLERS HTTP
+// =========================================================
+
+func HandleTaskAssignment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405); return
 	}
 
-	log.Printf("[Worker %s] Recibida tarea %s de tipo %s", workerID, task.TaskID, task.Operation.Type)
+	var task common.Task
+	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
+		http.Error(w, "JSON inválido", 400); return
+	}
 
-	// 2. Ejecutar la Tarea (Llamada al componente probado)
-	// ExecuteTask ahora devuelve una lista de metadatos de archivos
-	outputMeta, err := ExecuteTask(task)
+	atomic.AddInt32(&activeTasks, 1)
+	log.Printf("[Worker] Recibida tarea %s (Op: %s)", task.TaskID, task.Operation.Type)
 
+	// Ejecución asíncrona para no bloquear al Master
+	go runTaskAsync(task)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func handleShuffleFetch(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "Missing path", 400); return
+	}
+	// TODO: Validar que el path sea seguro (dentro de /tmp/mini-spark)
+	log.Printf("[Shuffle] Sirviendo %s a %s", path, r.RemoteAddr)
+	http.ServeFile(w, r, path)
+}
+
+// =========================================================
+// LÓGICA DE EJECUCIÓN CON TIMEOUT (Requerimiento PDF)
+// =========================================================
+
+func runTaskAsync(task common.Task) {
+	defer atomic.AddInt32(&activeTasks, -1)
+	
+	// Canales para manejar resultado o timeout
+	done := make(chan struct{})
+	var outputMeta []common.ShuffleMeta
+	var err error
+	
+	startTime := time.Now()
+
+	go func() {
+		// Esta llamada bloquea hasta que el Pool tenga espacio y la tarea termine
+		outputMeta, err = GlobalExecutor.Submit(task)
+		close(done)
+	}()
+
+	// Estructura del reporte base
 	report := common.TaskReport{
 		TaskID:    task.TaskID,
-		WorkerID:  workerID, 
+		JobID:     task.JobID,
+		StageID:   task.StageID,
+		WorkerID:  MyID,
 		Timestamp: time.Now().Unix(),
 	}
 
-	if err != nil {
-		// 3. Reporte de Falla
-		report.Status = common.TaskStatusFailure
-		report.ErrorMsg = err.Error()
-		log.Printf("[Worker %s] Tarea %s FALLÓ: %v", workerID, task.TaskID, err)
-	} else {
-		// 3. Reporte de Éxito
-		report.Status = common.TaskStatusSuccess
+	// SELECT: Esperar terminación O Timeout
+	select {
+	case <-done:
+		duration := time.Since(startTime).Milliseconds()
+		report.DurationMs = duration
 		
-		// Llenamos el reporte basado en el tipo de salida
-		if task.OutputTarget.Type == common.OutputTypeShuffle {
-			// Si es SHUFFLE, reportamos la lista de particiones
-			report.ShuffleOutput = outputMeta
-		} else if len(outputMeta) > 0 {
-			// Si es LOCAL_SPILL, tomamos la ruta del único archivo generado (part_0)
-			report.OutputPath = outputMeta[0].Path
+		if err != nil {
+			log.Printf("[Worker] Tarea %s FALLÓ tras %dms: %v", task.TaskID, duration, err)
+			report.Status = common.TaskStatusFailure
+			report.ErrorMsg = err.Error()
+		} else {
+			log.Printf("[Worker] Tarea %s ÉXITO en %dms", task.TaskID, duration)
+			report.Status = common.TaskStatusSuccess
+			if task.OutputTarget.Type == common.OutputTypeShuffle {
+				report.ShuffleOutput = outputMeta
+			} else if len(outputMeta) > 0 {
+				report.OutputPath = outputMeta[0].Path
+			}
 		}
-		
-		log.Printf("[Worker %s] Tarea %s OK. Generados %d archivos.", workerID, task.TaskID, len(outputMeta))
+
+	case <-time.After(TaskTimeout):
+		// CASO TIMEOUT (Requerimiento PDF: Terminación si excede tiempo)
+		log.Printf("[Worker] Tarea %s EXPIRÓ (Timeout > %s)", task.TaskID, TaskTimeout)
+		report.Status = common.TaskStatusFailure
+		report.ErrorMsg = fmt.Sprintf("Timeout execution limit exceeded (%s)", TaskTimeout)
+		report.DurationMs = time.Since(startTime).Milliseconds()
+		// Nota: En Go las goroutines no se pueden "matar" forzosamente desde fuera fácilmente 
+		// sin cooperacion, pero al menos reportamos el fallo y liberamos al Master.
 	}
 
-	// 4. Enviar Reporte al Master (ReportToMaster)
-	if reportErr := ReportToMaster(report); reportErr != nil {
-		// Loguear el error, pero la tarea se ejecutó localmente.
-		log.Printf("[Worker %s] ERROR al reportar al Master sobre la tarea %s: %v", workerID, task.TaskID, reportErr)
+	// Enviar reporte
+	if repErr := ReportToMaster(report); repErr != nil {
+		log.Printf("[Worker] ERROR reportando tarea %s: %v", task.TaskID, repErr)
 	}
-
-	// 5. Responder al Master
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Tarea %s recibida y procesando", task.TaskID)
 }
 
-// ReportToMaster envia el TaskReport de vuelta al Master.
-// Es una VARIABLE de función (var) para poder ser sobrescrita/mockeada en tests.
+// Variable para Mocking en tests
 var ReportToMaster = func(report common.TaskReport) error {
-	reportJSON, err := json.Marshal(report)
-	if err != nil {
-		return err
-	}
-
-	// El Master debe tener un endpoint para recibir reportes
-	url := fmt.Sprintf("%s/report", MasterAddress) 
-	
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reportJSON))
-	if err != nil {
-		return fmt.Errorf("no se pudo conectar con el Master en %s: %w", url, err)
-	}
+	data, _ := json.Marshal(report)
+	resp, err := http.Post(MasterURL+"/report", "application/json", bytes.NewBuffer(data))
+	if err != nil { return err }
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Podrías leer el cuerpo para obtener más detalles del error del Master
-		return fmt.Errorf("Master devolvio status %d", resp.StatusCode)
-	}
-	
 	return nil
+}
+
+// =========================================================
+// HEARTBEAT CON MÉTRICAS REALES (Requerimiento PDF)
+// =========================================================
+
+func startHeartbeatLoop() {
+	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// 1. Obtener Métricas de Memoria Reales
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		// Convertir bytes a MB
+		memUsageMB := m.Alloc / 1024 / 1024
+
+		hb := common.Heartbeat{
+			WorkerID:      MyID,
+			Address:       MyID,
+			Status:        determineStatus(),
+			ActiveTasks:   int(atomic.LoadInt32(&activeTasks)),
+			MemUsageMB:    memUsageMB, // Dato real
+			LastHeartbeat: time.Now().Unix(),
+		}
+
+		data, _ := json.Marshal(hb)
+		// Ignoramos error de heartbeat (es best-effort)
+		http.Post(MasterURL+"/heartbeat", "application/json", bytes.NewBuffer(data))
+	}
+}
+
+func determineStatus() string {
+	if atomic.LoadInt32(&activeTasks) >= 4 { // Si el pool está lleno
+		return common.WorkerStatusBusy
+	}
+	return common.WorkerStatusIdle
 }

@@ -1,60 +1,91 @@
 package master
 
 import (
-    "encoding/json"
-    "log"
-    "net/http"
-    "mini-spark/internal/common"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"mini-spark/internal/common"
+	"mini-spark/internal/storage"
+	"github.com/google/uuid"
+	"strings"
 )
 
-func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-    var hb common.Heartbeat
-
-    if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
-        http.Error(w, "JSON invalido de Heartbeat", http.StatusBadRequest)
-        return
-    }
-
-    log.Printf("[Master] Heartbeat recibido de Worker %s. Estado: %s", hb.WorkerID, hb.Status)
-
-    // Lógica de Heartbeat (PENDIENTE de implementación):
-    // 1. Almacenar/actualizar el estado del Worker (WorkerRegistry)
-    // 2. Actualizar el timestamp de "última vista" (LastHeartbeat)
-    
-    // Por simplicidad, solo respondemos 200 OK.
-    w.WriteHeader(http.StatusOK)
-    fmt.Fprintf(w, "Heartbeat %s recibido", hb.WorkerID)
+type MasterServer struct {
+	Scheduler *Scheduler
+	Registry  *WorkerRegistry
+	Store     *storage.JobStore
 }
 
+func (s *MasterServer) HandleSubmitJob(w http.ResponseWriter, r *http.Request) {
+	var req common.JobRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	req.JobID = uuid.New().String()
+	s.Store.SaveJob(&req)
+	
+	fmt.Printf("[Master] Job recibido: %s con %d etapas.\n", req.JobID, len(req.Graph))
 
-// Este handler debe añadirse a tu Master's mux (ej. en StartServer)
-// mux.HandleFunc("POST /report", handleTaskReport)
+	// Iniciar la PRIMERA etapa (Graph[0])
+	firstNode := req.Graph[0]
+	var tasks []common.Task
+	
+	// IMPORTANTE: Definir cuántas particiones tendrá la SIGUIENTE etapa (Reduce)
+	// para que el Map sepa en cuántos buckets dividir.
+	nextPartitions := 1
+	if len(req.Graph) > 1 {
+		nextPartitions = req.Graph[1].Partitions
+	}
 
-func handleTaskReport(w http.ResponseWriter, r *http.Request) {
-    var report common.TaskReport
+	for i := 0; i < firstNode.Partitions; i++ {
+		tasks = append(tasks, common.Task{
+			TaskID: fmt.Sprintf("%s-%s-%d", req.JobID, firstNode.ID, i),
+			JobID: req.JobID,
+			StageID: firstNode.ID,
+			Operation: firstNode,
+			InputPartition: common.TaskInput{
+				SourceType: common.SourceTypeFile,
+				Path: req.InputPath,
+			},
+			OutputTarget: common.TaskOutput{
+				Type: common.OutputTypeShuffle, // Map siempre hace Shuffle en este modelo
+				Path: fmt.Sprintf("/tmp/mini-spark/%s/%s", req.JobID, firstNode.ID),
+				Partitions: nextPartitions, // Buckets = particiones del Reduce
+			},
+		})
+	}
+	s.Scheduler.SubmitTasks(tasks)
+	
+	json.NewEncoder(w).Encode(map[string]string{"job_id": req.JobID, "status": "SUBMITTED"})
+}
 
-    // 1. Deserializar el Reporte
-    if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
-        http.Error(w, "JSON invalido del reporte", http.StatusBadRequest)
-        return
-    }
+func (s *MasterServer) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var hb common.Heartbeat
+	if err := json.NewDecoder(r.Body).Decode(&hb); err != nil { return }
+	s.Registry.UpdateHeartbeat(hb)
+}
 
-    log.Printf("[Master] Reporte recibido de Worker %s para Tarea %s. Estado: %s", report.WorkerID, report.TaskID, report.Status)
+// En /internal/master/api.go
 
-    // 2. Lógica de Actualización de Estado (Pendiente de implementación)
-    // Aquí es donde el Master actualiza el JobStatus en su base de datos/memoria.
-    
-    // Si la tarea falló, se debe re-encolar.
-    if report.Status == common.TaskStatusFailure {
-        log.Printf("[Master] Iniciando lógica de reintento para Tarea %s", report.TaskID)
-        // Ejemplo: Buscar la tarea original y re-encolarla en el Scheduler
-        // s.EnqueueTasks([]common.Task{originalTask}) 
-    }
-    
-    // Si la tarea fue exitosa, el Master marca la partición como completada y
-    // verifica si la etapa (stage) terminó.
+func (s *MasterServer) HandleReport(w http.ResponseWriter, r *http.Request) {
+	var rep common.TaskReport
+	if err := json.NewDecoder(r.Body).Decode(&rep); err != nil { return }
+	
+	fmt.Printf("[Master] Reporte: Tarea %s [%s] Worker %s\n", rep.TaskID, rep.Status, rep.WorkerID)
+	
+	// YA NO NECESITAMOS PARSEAR STRINGS. Usamos los datos explícitos.
+	jobID := rep.JobID
+	stageID := rep.StageID
 
-    // 3. Responder al Worker
-    w.WriteHeader(http.StatusOK)
-    fmt.Fprintf(w, "Reporte %s recibido", report.TaskID)
+	if jobID != "" && stageID != "" {
+		s.Store.SaveTaskReport(jobID, stageID, rep)
+		
+		if rep.Status == common.TaskStatusSuccess {
+			// Notificar al Scheduler que una tarea terminó exitosamente
+			s.Scheduler.OnTaskCompleted(rep, jobID, stageID)
+		}
+	} else {
+		fmt.Println("[Master] Error: Reporte recibido sin JobID o StageID")
+	}
 }

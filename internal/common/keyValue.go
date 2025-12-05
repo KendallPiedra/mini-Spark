@@ -3,4 +3,5 @@ package common
 type KeyValue struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+	Source string `json:"source,omitempty"`
 }
