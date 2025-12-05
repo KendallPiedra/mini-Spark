@@ -1,16 +1,5 @@
-2025/12/05 09:35:56  Master iniciado en puerto :8080
-2025/12/05 09:35:56    - Esperando workers...
-2025/12/05 09:35:57 [Registry] Worker localhost:8082 registrado/recuperado (Address: localhost:8082)
-2025/12/05 09:35:57 [Registry] Worker localhost:8081 registrado/recuperado (Address: localhost:8081)
-2025/12/05 09:36:21 [Scheduler] Planificando Job 89823638-f588-41fc-ad66-2a4246f3ede6 (Benchmark-1M)
-2025/12/05 09:36:21 [Scheduler] Encoladas 4 tareas para etapa map-bench (Input: FILE)
-2025/12/05 09:36:26 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-map-bench-3
-2025/12/05 09:36:26 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-map-bench-1
-2025/12/05 09:36:26 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-map-bench-0
-2025/12/05 09:36:26 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-map-bench-2
-2025/12/05 09:36:26 [Scheduler] Stage map-bench completado. 4/4 tareas.
-2025/12/05 09:36:26 [Scheduler] Encoladas 2 tareas para etapa reduce-bench (Input: SHUFFLE)
-2025/12/05 09:36:29 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-reduce-bench-0
-2025/12/05 09:36:30 [Scheduler] Tarea Completada: 89823638-f588-41fc-ad66-2a4246f3ede6-reduce-bench-1
-2025/12/05 09:36:30 [Scheduler] Stage reduce-bench completado. 2/2 tareas.
-2025/12/05 09:36:30 === JOB 89823638-f588-41fc-ad66-2a4246f3ede6 FINALIZADO EXITOSAMENTE ===
+2025/12/05 15:42:09  Master iniciado en puerto :8080
+2025/12/05 15:42:09    - Esperando workers...
+2025/12/05 15:42:14 [Registry] Worker localhost:8081 registrado/recuperado (Address: localhost:8081)
+2025/12/05 15:42:14 [Registry] Worker localhost:8082 registrado/recuperado (Address: localhost:8082)
+2025/12/05 15:42:33 [Registry] Worker localhost:8088 registrado/recuperado (Address: localhost:8088)

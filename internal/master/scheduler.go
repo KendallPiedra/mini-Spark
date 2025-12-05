@@ -79,7 +79,7 @@ func (s *Scheduler) enqueueStageTasks(job *common.JobRequest, node common.Operat
                 },
                 OutputTarget: common.TaskOutput{
                     Type:       common.OutputTypeShuffle,
-                    Path:       fmt.Sprintf("/tmp/spark/%s/%s", job.JobID, node.ID),
+                    Path:       fmt.Sprintf("./data/outputs/%s/%s", job.JobID, node.ID),
                     NumPartitions: node.NumPartitions,
                 },
             })

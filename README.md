@@ -90,10 +90,10 @@ Aumentar el tamaño de los datos o usar el benchmark (make benchmark).
 Mientras el trabajo está en estado RUNNING, identificar el PID de un worker:
 
 Bash
-
+```
 ps aux | grep worker
 Matar el proceso:
-
+```
 Bash
 
 kill -9 <PID_WORKER>

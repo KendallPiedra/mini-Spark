@@ -20,7 +20,7 @@ var (
 	jobIDArg   string
 	poll       bool
 )
-
+// Se ejecuta el cliente
 func main() {
 	// Definir argumentos de línea de comandos
 	flag.StringVar(&masterURL, "master", "http://localhost:8080", "URL del Master")
@@ -61,14 +61,13 @@ func main() {
 		}
 		return
 	}
-
-	// Si no hay argumentos
+	// Si no se especifica ningún modo, mostrar ayuda
 	fmt.Println("Uso del Cliente:")
 	fmt.Println("  Enviar Job:      go run cmd/client/main.go -submit jobs_specs/wordcount.json -watch")
 	fmt.Println("  Consultar Job:   go run cmd/client/main.go -status <JOB_ID>")
 	flag.PrintDefaults()
 }
-
+// Enviar Job al Master y retornar el Job ID asignado
 func submitJob(data []byte) string {
 	resp, err := http.Post(masterURL+"/api/v1/jobs", "application/json", bytes.NewBuffer(data))
 	if err != nil {
@@ -85,7 +84,7 @@ func submitJob(data []byte) string {
 	json.NewDecoder(resp.Body).Decode(&res)
 	return res["job_id"]
 }
-
+// Consultar estado de un Job por su ID
 func checkStatus(id string) {
 	resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", masterURL, id))
 	if err != nil {
@@ -94,9 +93,9 @@ func checkStatus(id string) {
 	}
 	defer resp.Body.Close()
 	io.Copy(os.Stdout, resp.Body)
-	fmt.Println() // Salto de línea
+	fmt.Println() 
 }
-
+// Monitorear el estado del Job hasta que finalice
 func monitorJob(jobID string) {
 	fmt.Println(" Monitoreando...")
 	for {
@@ -106,10 +105,11 @@ func monitorJob(jobID string) {
 		var status map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&status)
 		resp.Body.Close()
-
+		// Mostrar estado actual del Job
 		st := status["Status"].(string)
-		fmt.Printf("\r>> Estado: %s   ", st) // \r para sobrescribir línea
+		fmt.Printf("\r>> Estado: %s   ", st) 
 
+		// Verificar si el Job ha finalizado
 		if st == "SUCCEEDED" || st == "FAILED" {
 			fmt.Println("\n Finalizado.")
 			break

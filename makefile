@@ -37,6 +37,13 @@ run-cluster: build
 	@nohup $(WORKER_BIN) -port 8082 > $(LOGS_DIR)/worker_8082.log 2>&1 & echo $$! > $(LOGS_DIR)/worker_8082.pid
 	@echo " Clúster activo. Logs en /logs/"
 
+add-worker:
+	@echo " Agregando un nuevo Worker ESTABLE..."
+	@mkdir -p $(LOGS_DIR)
+	@WORKER_PORT=$$(shuf -i 8083-8099 -n 1); \
+	 nohup $(WORKER_BIN) -port $$WORKER_PORT > $(LOGS_DIR)/worker_$$WORKER_PORT.log 2>&1 & echo $$! > $(LOGS_DIR)/worker_$$WORKER_PORT.pid; \
+	 echo " Nuevo Worker iniciado en puerto $$WORKER_PORT (PID: `cat $(LOGS_DIR)/worker_$$WORKER_PORT.pid`)."
+
 stop-cluster:
 	@echo " Deteniendo clúster..."
 	@pkill -f $(MASTER_BIN) || true
@@ -46,7 +53,7 @@ stop-cluster:
 
 # 3. Demos Rápidos (Se mantienen igual)
 demo-wordcount:
-	@echo "▶ Ejecutando WordCount..."
+	@echo " Ejecutando WordCount..."
 	@$(CLIENT_BIN) -submit jobs_specs/wordcount.json -watch
 
 demo-join:
@@ -83,7 +90,7 @@ kill-worker:
 	@echo " Matando Worker en puerto $(WORKER_PORT) (PID: `cat $$PID_FILE`)..."
 	@kill -9 `cat $$PID_FILE` || true
 	@rm $$PID_FILE || true
-	@echo " Worker $(WORKER_PORT) asesinado. Esperando que el Master detecte el fallo."
+	@echo " Worker $(WORKER_PORT) muerto. Esperando que el Master detecte el fallo."
 # 5. Limpieza
 clean:
 	@echo " Limpiando..."

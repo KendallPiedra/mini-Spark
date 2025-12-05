@@ -236,15 +236,14 @@ func downloadShuffleToTemp(shuffleMap map[string]string, destPath string) error 
 	return nil
 }
 
-// ... (MemoryAggregator y resto de helpers se mantienen igual que la versión anterior) ...
-
+// Agregador en Memoria con Spill a Disco
 type MemoryAggregator struct {
 	data      map[string][]string
 	sizeBytes int64
 	limit     int64
 	spillFiles []string
 }
-
+// Crear un nuevo agregador en memoria con límite de tamaño
 func NewMemoryAggregator(limit int64) *MemoryAggregator {
 	return &MemoryAggregator{
 		data:  make(map[string][]string),
@@ -252,16 +251,26 @@ func NewMemoryAggregator(limit int64) *MemoryAggregator {
 	}
 }
 
+// Agrega un par clave-valor al agregador en memoria
 func (m *MemoryAggregator) Add(key, value string) {
 	m.data[key] = append(m.data[key], value)
 	m.sizeBytes += int64(len(key) + len(value))
-	if m.sizeBytes > m.limit { m.SpillToDisk() }
+	if m.sizeBytes > m.limit { 
+		m.SpillToDisk() 
+	}
 }
 
 func (m *MemoryAggregator) SpillToDisk() {
+	// Generar un nombre de archivo temporal único
 	tmpName := fmt.Sprintf("/tmp/spill_%d_%d.jsonl", time.Now().UnixNano(), len(m.spillFiles))
-	f, _ := os.Create(tmpName)
+	f, err := os.Create(tmpName)
+	if err != nil {
+		log.Printf("[ERROR] Fallo al crear archivo de spill: %v", err)
+		return
+	}
 	w := bufio.NewWriter(f)
+	
+	// Serializar cada par K/V como una línea JSON (JSON Lines - JSONL)
 	for k, vals := range m.data {
 		for _, v := range vals {
 			kv := common.KeyValue{Key: k, Value: v}
@@ -269,28 +278,45 @@ func (m *MemoryAggregator) SpillToDisk() {
 			w.WriteString(string(b) + "\n")
 		}
 	}
-	w.Flush(); f.Close()
+	
+	w.Flush()
+	f.Close()
+	
+	// Actualizar estado del agregador
 	m.spillFiles = append(m.spillFiles, tmpName)
-	m.data = make(map[string][]string)
-	m.sizeBytes = 0
+	m.data = make(map[string][]string) // Vaciar la memoria
+	m.sizeBytes = 0                    // Resetear el contador
+	log.Printf("[Executor] Spill a disco: %s", tmpName)
 }
 
+// GetDataMap recupera los datos espilleados del disco y los fusiona con los datos en memoria.
 func (m *MemoryAggregator) GetDataMap() map[string][]string {
+	// Recuperar datos de todos los archivos de spill
 	for _, path := range m.spillFiles {
-		f, _ := os.Open(path)
+		f, err := os.Open(path)
+		if err != nil {
+			log.Printf("[ERROR] No se pudo abrir archivo de spill %s: %v", path, err)
+			continue
+		}
 		sc := bufio.NewScanner(f)
+		
+		// Deserializar JSON Lines y fusionar en el mapa 'data'
 		for sc.Scan() {
 			var kv common.KeyValue
-			json.Unmarshal(sc.Bytes(), &kv)
-			m.data[kv.Key] = append(m.data[kv.Key], kv.Value)
+			if err := json.Unmarshal(sc.Bytes(), &kv); err == nil {
+				m.data[kv.Key] = append(m.data[kv.Key], kv.Value)
+			}
 		}
 		f.Close()
 	}
+	// El mapa 'data' ahora contiene todos los datos agregados (Memoria + Disco)
 	return m.data
 }
 
 func (m *MemoryAggregator) Cleanup() {
-	for _, p := range m.spillFiles { os.Remove(p) }
+	for _, p := range m.spillFiles { 
+		os.Remove(p) 
+	}
 }
 
 func downloadAndMerge(url string, agg *MemoryAggregator) error {
