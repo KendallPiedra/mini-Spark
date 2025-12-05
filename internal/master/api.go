@@ -7,6 +7,26 @@ import (
     "mini-spark/internal/common"
 )
 
+func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+    var hb common.Heartbeat
+
+    if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
+        http.Error(w, "JSON invalido de Heartbeat", http.StatusBadRequest)
+        return
+    }
+
+    log.Printf("[Master] Heartbeat recibido de Worker %s. Estado: %s", hb.WorkerID, hb.Status)
+
+    // Lógica de Heartbeat (PENDIENTE de implementación):
+    // 1. Almacenar/actualizar el estado del Worker (WorkerRegistry)
+    // 2. Actualizar el timestamp de "última vista" (LastHeartbeat)
+    
+    // Por simplicidad, solo respondemos 200 OK.
+    w.WriteHeader(http.StatusOK)
+    fmt.Fprintf(w, "Heartbeat %s recibido", hb.WorkerID)
+}
+
+
 // Este handler debe añadirse a tu Master's mux (ej. en StartServer)
 // mux.HandleFunc("POST /report", handleTaskReport)
 
