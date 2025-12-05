@@ -12,97 +12,137 @@ import (
 	"mini-spark/internal/common"
 )
 
+// URL del Master
+const MasterURL = "http://localhost:8080"
+
 func main() {
-	masterURL := "http://localhost:8080"
+	fmt.Println("--- INICIANDO CLIENTE MINI-SPARK (JOIN TEST) ---")
 
-	// 1. Generar datos de prueba
-	createDummyData("/tmp/input_big.txt")
+	// 1. Generar datos de prueba (Simulando dos tablas: Usuarios y Órdenes)
+	inputPath := "/tmp/input_join.txt"
+	createJoinData(inputPath)
 
-	// 2. Definir el Job con estructura DAG
+	// 2. Definir el Job con estructura DAG para un JOIN
 	job := common.JobRequest{
-		Name:       "WordCount-DAG",
-		InputPath:  "/tmp/input_big.txt",
+		Name:       "Join-Users-Orders",
+		InputPath:  inputPath,
 		NumPartitions: 2, // Paralelismo global
 		DAG: common.DAG{
 			Nodes: []common.OperationNode{
-				// Nodo 0: Map (Lectura y Tokenización)
+				// NODO 1: MAP
+				// Lee el archivo mixto y etiqueta: "L:" para usuarios, "R:" para órdenes.
 				{
-					ID:         "stage-map",
-					Type:       common.OpTypeMap, // "MAP"
-					UDFName:    "map_wordcount",
-					NumPartitions: 2, // 2 Workers leyendo
+					ID:            "stage-map-parse",
+					Type:          common.OpTypeMap, 
+					UDFName:       "map_parse_tables", 
+					NumPartitions: 2,
 				},
-				// Nodo 1: Reduce (Suma por clave)
+				// NODO 2: JOIN
+				// Recibe datos barajados (Shuffle) por ID y cruza L con R.
 				{
-					ID:         "stage-reduce",
-					Type:       common.OpTypeReduceByKey, // "REDUCE_BY_KEY"
-					UDFName:    "reduce_sum",
-					NumPartitions: 2, // 2 Workers reduciendo
+					ID:            "stage-join",
+					Type:          common.OpTypeJoin, 
+					UDFName:       "join_users_orders",
+					NumPartitions: 2,
 				},
 			},
-			// Definimos el flujo de datos: Map -> Reduce
+			// Definimos la dependencia: Map -> Join
 			Edges: [][]string{
-				{"stage-map", "stage-reduce"},
+				{"stage-map-parse", "stage-join"},
 			},
 		},
 	}
 
-	// 3. Enviar el Job
-	fmt.Println("Enviando Job al Master...")
-	jobID := submitJob(masterURL, job)
-	fmt.Printf("Job aceptado con ID: %s\n", jobID)
+	// 3. Enviar el Job al Master
+	fmt.Println("🚀 Enviando Job al Master...")
+	jobID := submitJob(job)
+	fmt.Printf("✅ Job aceptado con ID: %s\n", jobID)
 
-	// 4. Polling de estado
-	monitorJob(masterURL, jobID)
+	// 4. Monitorear el estado hasta que termine
+	monitorJob(jobID)
 }
 
-func submitJob(baseURL string, job common.JobRequest) string {
+// --- FUNCIONES AUXILIARES ---
+
+func createJoinData(path string) {
+	// Generamos un archivo CSV mixto
+	// Formato Usuarios: U,ID,Nombre
+	// Formato Órdenes:  O,OrderID,UserID,Producto
+	content := ""
+	
+	// Usuarios
+	content += "U,1,Juan\n"
+	content += "U,2,Maria\n"
+	content += "U,3,Pedro\n"
+	content += "U,4,Ana\n"
+	
+	// Pedidos
+	content += "O,100,1,Laptop\n"   // Juan compró Laptop
+	content += "O,101,1,Mouse\n"    // Juan compró Mouse
+	content += "O,102,2,Monitor\n"  // Maria compró Monitor
+	content += "O,103,4,Teclado\n"  // Ana compró Teclado
+	content += "O,104,4,Webcam\n"   // Ana compró Webcam
+	// Pedro no compró nada (no aparecerá en el Join)
+
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		panic(fmt.Sprintf("Error creando archivo de datos: %v", err))
+	}
+	fmt.Printf("📝 Datos de prueba creados en %s\n", path)
+}
+
+func submitJob(job common.JobRequest) string {
 	data, _ := json.Marshal(job)
-	resp, err := http.Post(baseURL+"/api/v1/jobs", "application/json", bytes.NewBuffer(data))
+	resp, err := http.Post(MasterURL+"/api/v1/jobs", "application/json", bytes.NewBuffer(data))
 	if err != nil {
-		panic(fmt.Sprintf("Error contactando master: %v", err))
+		panic(fmt.Sprintf("Error contactando master: %v. ¿Está encendido?", err))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		panic(fmt.Sprintf("Master rechazó job: %s", string(body)))
+		panic(fmt.Sprintf("Master rechazó job (%d): %s", resp.StatusCode, string(body)))
 	}
 
 	var res map[string]string
-	json.NewDecoder(resp.Body).Decode(&res)
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		panic("Error decodificando respuesta del Master")
+	}
 	return res["job_id"]
 }
 
-func monitorJob(baseURL, jobID string) {
+func monitorJob(jobID string) {
+	fmt.Println("⏳ Monitoreando estado del Job...")
 	for {
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, jobID))
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/jobs/%s", MasterURL, jobID))
 		if err != nil {
-			fmt.Printf("Error consultando estado: %v\n", err)
+			fmt.Printf("⚠️ Error consultando estado: %v\n", err)
 			break
 		}
 		
 		var status map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&status)
-		resp.Body.Close()
-
-		currentState := status["Status"].(string)
-		fmt.Printf("Estado del Job: %s\n", currentState)
-
-		if currentState == "SUCCEEDED" || currentState == "FAILED" {
+		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			fmt.Println("Error leyendo respuesta de estado")
+			resp.Body.Close()
 			break
 		}
+		resp.Body.Close()
+
+		// Extraer estado, manejando posibles nulos
+		stateInterface := status["Status"]
+		if stateInterface == nil {
+			fmt.Println("Estado desconocido recibido del Master")
+			break
+		}
+		currentState := stateInterface.(string)
+		
+		fmt.Printf(">> Estado actual: %s\n", currentState)
+
+		if currentState == "SUCCEEDED" || currentState == "FAILED" {
+			fmt.Println("🏁 Ejecución finalizada.")
+			break
+		}
+		
+		// Esperar un poco antes de volver a consultar
 		time.Sleep(1 * time.Second)
 	}
-}
-
-func createDummyData(path string) {
-	content := "gato perro gato raton perro gato elefante nube nube sol gato"
-	// Multiplicamos para tener algo de volumen
-	fullContent := ""
-	for i := 0; i < 500; i++ {
-		fullContent += content + "\n"
-	}
-	os.WriteFile(path, []byte(fullContent), 0644)
-	fmt.Printf("Archivo de entrada creado en %s\n", path)
 }

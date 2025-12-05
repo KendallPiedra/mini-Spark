@@ -97,8 +97,37 @@ func executeMapSide(task common.Task) ([]common.ShuffleMeta, error) {
 		}
 	}
 
-	// Procesar línea por línea
+	//=================================
 	scanner := bufio.NewScanner(inputFile)
+	//spliting
+	lineCounter := 0
+	totalPartitions := task.Operation.NumPartitions
+	if totalPartitions <= 0 { totalPartitions = 1 }
+	// ---------------------------
+
+	for scanner.Scan() {
+		// FILTRO DE PARTICIÓN
+		if lineCounter % totalPartitions == task.PartitionIndex {
+			
+			// PROCESAR SOLO SI ME TOCA
+			line := scanner.Text()
+			results := processFn(udf.Record(line))
+
+			for _, res := range results {
+				partID := 0
+				if task.OutputTarget.Type == common.OutputTypeShuffle {
+					partID = getPartitionID(string(res), task.OutputTarget.NumPartitions)
+				}
+				if w, ok := writers[partID]; ok {
+					w.WriteString(string(res) + "\n")
+				}
+			}
+		}
+		lineCounter++
+	}
+
+	// Procesar línea por línea
+	//scanner := bufio.NewScanner(inputFile)
 	numPartitions := task.OutputTarget.NumPartitions
 	if numPartitions <= 0 { numPartitions = 1 }
 

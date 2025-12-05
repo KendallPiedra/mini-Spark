@@ -8,6 +8,7 @@ type Task struct {
 	InputPartition TaskInput `json:"input_partition"` // Particion de entrada para esta tarea
 	OutputTarget TaskOutput `json:"output_target"`   // Destino de salida para esta tarea
 	RetryCount  int    `json:"retry_count"`    // Reintentos realizados
+	PartitionIndex int    `json:"partition_index"` // Índice de partición (0 a N-1)
 }
 
 type TaskInput struct {

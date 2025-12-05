@@ -71,6 +71,7 @@ func (s *Scheduler) enqueueStageTasks(job *common.JobRequest, node common.Operat
                 TaskID:    fmt.Sprintf("%s-%s-%d", job.JobID, node.ID, i),
                 JobID:     job.JobID,
                 StageID:   node.ID,
+				PartitionIndex: i,
                 Operation: node,
                 InputPartition: common.TaskInput{
                     SourceType: inputType, // <--- CORRECCIÓN: Usamos la variable aquí
