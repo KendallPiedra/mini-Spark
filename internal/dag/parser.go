@@ -3,13 +3,14 @@ package dag
 import (
 	"fmt"
 	"github.com/google/uuid"
-	"my-mini-spark/internal/common" 
+	"mini-spark/internal/common" // Asumimos que esta ruta contiene los archivos .go de los structs
 )
 
-// GenerateMapTasks crea N tareas (Tasks) a partir de una OperationNode.
-// Divide el archivo de entrada.
-func GenerateMapTasks(job *common.JobRequest, node common.OperationNode) ([]common.Task, error) {
-	if node.Type != "MAP" && node.Type != "FILTER" {
+// GenerateMapTasks crea N tareas (Tasks) a partir de una OperationNode,
+// dividiendo el archivo de entrada.
+func GenerateMapTasks(job common.JobRequest, node common.OperationNode) ([]common.Task, error) {
+	// Usamos las constantes definidas en el paquete common (si están en otro archivo como 'types.go')
+	if node.Type != common.OpTypeMap && node.Type != common.OpTypeFilter {
 		return nil, fmt.Errorf("tipo de operacion no soportada para la fase 2: %s", node.Type)
 	}
 
@@ -17,8 +18,6 @@ func GenerateMapTasks(job *common.JobRequest, node common.OperationNode) ([]comm
 	if totalTasks <= 0 {
 		return nil, fmt.Errorf("el numero de particiones debe ser mayor a cero")
 	}
-
-	// Se asume que cada tarea procesa el archivo completo. 
 
 	tasks := make([]common.Task, totalTasks)
 
@@ -29,13 +28,12 @@ func GenerateMapTasks(job *common.JobRequest, node common.OperationNode) ([]comm
 			StageID: node.ID,
 			Operation: node,
 			InputPartition: common.TaskInput{
-				SourceType: common.SourceTypeFile, // "FILE"
+				SourceType: common.SourceTypeFile, // Constante del archivo de tipos
 				Path:       job.InputPath,
-				Offsets:    [2]int64{0, 0}, // Placeholder para la particion
-				// ShuffleMap queda vacío.
+				Offsets:    [2]int64{0, 0}, 
 			},
 			OutputTarget: common.TaskOutput{
-				Type: common.OutputTypeLocalSpill, // "LOCAL_SPILL" (guardar temporalmente)
+				Type: common.OutputTypeLocalSpill, // Constante del archivo de tipos
 				Path: fmt.Sprintf("/tmp/mini-spark/%s_task_%d_out", job.JobID, i),
 			},
 		}
